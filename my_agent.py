@@ -162,7 +162,7 @@ def _str_env_any(names: Sequence[str], default: str | None = None) -> str | None
 
 @dataclass(frozen=True)
 class AgentConfig:
-    agent_version: str = "v1.6-contract-compiler-level-theory"
+    agent_version: str = "v1.7-option-repair-explore"
     enable_vlm: bool = True
     model_path: str | None = None
     image_size: int = 512
@@ -171,10 +171,10 @@ class AgentConfig:
     vlm_first_life_soft_limit: int = 18
     vlm_retry_reserve: int = 10
     vlm_min_action_gap: int = 4
-    vlm_max_new_tokens: int = 1100
+    vlm_max_new_tokens: int = 2048
     plan_horizon: int = 20
     max_recent_events: int = 36
-    max_event_log: int = 720
+    max_event_log: int = 3000
     max_prompt_events: int = 12
     max_prompt_objects: int = 14
     max_action6_candidates: int = 32
@@ -186,8 +186,7 @@ class AgentConfig:
     vlm_success_consolidation_reserve: int = 2
     enable_success_consolidation_vlm: bool = True
     enable_transfer_bootstrap: bool = True
-    enable_proposal_controller: bool = True
-    log_dir: str | None = "./runs/agent_v1_6"
+    log_dir: str | None = "./runs/agent_v1_7"
     debug: bool = False
     vlm_backend: str = "local"
     vlm_api_base_url: str | None = None
@@ -234,7 +233,7 @@ class AgentConfig:
             ),
             vlm_max_new_tokens=_int_env_any(
                 ("ARC_V15_VLM_MAX_NEW_TOKENS", "ARC_V13_VLM_MAX_NEW_TOKENS", "ARC_V12_VLM_MAX_NEW_TOKENS", "ARC_V3_VLM_MAX_NEW_TOKENS"),
-                1100,
+                2048,
                 128,
                 4096,
             ),
@@ -250,7 +249,7 @@ class AgentConfig:
                 1,
                 128,
             ),
-            max_event_log=_int_env_any(("ARC_V15_MAX_EVENT_LOG",), 720, 64, 5000),
+            max_event_log=_int_env_any(("ARC_V15_MAX_EVENT_LOG",), 3000, 64, 8000),
             max_prompt_events=_int_env_any(
                 ("ARC_V15_MAX_PROMPT_EVENTS", "ARC_V13_MAX_PROMPT_EVENTS"), 12, 4, 64
             ),
@@ -265,11 +264,10 @@ class AgentConfig:
             ),
             log_dir=_str_env_any(
                 ("ARC_V15_LOG_DIR", "ARC_V13_LOG_DIR", "ARC_V12_LOG_DIR", "ARC_V3_LOG_DIR"),
-                "./runs/agent_v1_6",
+                "./runs/agent_v1_7",
             ),
             enable_success_consolidation_vlm=_bool_env_any(("ARC_V15_SUCCESS_VLM",), True),
             enable_transfer_bootstrap=_bool_env_any(("ARC_V15_TRANSFER_BOOTSTRAP",), True),
-            enable_proposal_controller=_bool_env_any(("ARC_V15_PROPOSAL_CONTROLLER",), True),
             debug=_bool_env_any(
                 ("ARC_V15_DEBUG", "ARC_V13_DEBUG", "ARC_V12_DEBUG", "ARC_V3_DEBUG"), False
             ),
@@ -329,6 +327,7 @@ class VLMMode(str, Enum):
     PLAN_SYNTHESIS = "PLAN_SYNTHESIS"
     SUCCESS_CONSOLIDATION = "SUCCESS_CONSOLIDATION"
     FAILURE_REPAIR = "FAILURE_REPAIR"
+    REPAIR_DECISION = "REPAIR_DECISION"
 
 
 class RejectReason(str, Enum):
@@ -426,7 +425,7 @@ class ActionProposal:
         expected_change = ""
         if self.expected_predicates:
             expected_change = _short_string(self.expected_predicates[0].get("summary"), 240)
-        return {
+        step = {
             "name": self.action_name,
             "x": self.x,
             "y": self.y,
@@ -436,6 +435,101 @@ class ActionProposal:
             "expected_predicates": self.expected_predicates,
             "source": self.source,
         }
+        for extra_key in (
+            "candidate_id",
+            "candidate_kind",
+            "repair_candidate_id",
+            "vlm_repair_selected",
+            "relaxed_frontier",
+            "only_action6_frontier",
+        ):
+            if extra_key in self.raw:
+                step[extra_key] = self.raw[extra_key]
+        if self.raw.get("relaxed_frontier"):
+            step["relaxed_recovery"] = True
+        return step
+
+
+@dataclass
+class ActivePlanStep:
+    step_id: str
+    intent: ActionIntent
+    expected_predicates: list[dict[str, Any]] = field(default_factory=list)
+    preconditions: list[dict[str, Any]] = field(default_factory=list)
+    status: str = "pending"
+    attempts: int = 0
+    max_attempts: int = 1
+    last_failure: str = ""
+
+
+@dataclass
+class ActivePlan:
+    plan_id: str
+    source: str
+    goal: str = ""
+    theory_id: str = ""
+    steps: list[ActivePlanStep] = field(default_factory=list)
+    cursor: int = 0
+    confidence: float = 0.0
+    evidence_level: int = 0
+    status: str = "candidate"
+    failures: int = 0
+
+    def current_step(self) -> ActivePlanStep | None:
+        while self.cursor < len(self.steps) and self.steps[self.cursor].status in {"done", "skipped"}:
+            self.cursor += 1
+        if self.cursor >= len(self.steps):
+            return None
+        return self.steps[self.cursor]
+
+    def as_prompt(self) -> dict[str, Any]:
+        return {
+            "plan_id": self.plan_id,
+            "source": self.source,
+            "goal": self.goal[:300],
+            "theory_id": self.theory_id,
+            "cursor": self.cursor,
+            "confidence": round(self.confidence, 3),
+            "evidence_level": self.evidence_level,
+            "status": self.status,
+            "failures": self.failures,
+            "steps": [
+                {
+                    "step_id": step.step_id,
+                    "status": step.status,
+                    "attempts": step.attempts,
+                    "intent": _json_safe(step.intent),
+                    "expected_predicates": step.expected_predicates[:6],
+                    "last_failure": step.last_failure,
+                }
+                for step in self.steps[:12]
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class Action6Signature:
+    state_hash: str
+    x: int
+    y: int
+    object_id: str = ""
+    object_type_key: str = ""
+    candidate_kind: str = ""
+    local_patch_signature: str = ""
+
+    @property
+    def xy_key(self) -> str:
+        return f"ACTION6:{self.x},{self.y}"
+
+    @property
+    def exact_key(self) -> str:
+        seed = f"{self.state_hash}:{self.x},{self.y}:{self.object_id}:{self.candidate_kind}:{self.local_patch_signature}"
+        return "A6E:" + hashlib.sha1(seed.encode()).hexdigest()[:12]
+
+    @property
+    def local_key(self) -> str:
+        seed = f"{self.state_hash}:{self.object_type_key}:{self.candidate_kind}:{self.local_patch_signature}"
+        return "A6L:" + hashlib.sha1(seed.encode()).hexdigest()[:12]
 
 
 @dataclass
@@ -673,6 +767,13 @@ class FailureModel:
         candidate_sig = ">".join(candidate)
         for item in self.forbidden_action_suffixes:
             sig = str(item.get("signature", ""))
+            # A single-action suffix would forbid an entire primitive globally
+            # (every sequence ending in that action), over-generalizing across
+            # states and levels and potentially banning the only usable action.
+            # Single-step lethal actions belong in state-bound memory, not here,
+            # so only 2+ action patterns are allowed to hard-forbid.
+            if len(item.get("suffix", []) or []) < 2:
+                continue
             if sig and candidate_sig.endswith(sig):
                 return True
         return False
@@ -849,8 +950,6 @@ def _stable_grid_hash(grid: tuple[tuple[int, ...], ...]) -> str:
     for row in grid:
         h.update(bytes(row))
     return h.hexdigest()
-
-
 
 
 @dataclass(frozen=True)
@@ -1225,11 +1324,25 @@ class LevelMemory:
     action_attempt_counts_by_state: dict[str, dict[str, int]] = field(default_factory=dict)
     noop_actions_by_state: dict[str, set[str]] = field(default_factory=dict)
     transition_graph: dict[str, dict[str, str]] = field(default_factory=dict)
-    plan: deque[dict[str, Any]] = field(default_factory=deque)
     plan_goal: str = ""
     plan_target_id: str = ""
     plan_id: int = 0
-    plan_failures: int = 0
+    active_plan: ActivePlan | None = None
+    candidate_plans: deque[ActivePlan] = field(default_factory=lambda: deque(maxlen=6))
+    disabled_action_families_until: dict[str, int] = field(default_factory=dict)
+    nonprogress_action_records: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=48))
+    suspicious_action_counts: Counter[str] = field(default_factory=Counter)
+    last_nonprogress_repair_step: int = -999
+    fallback_action_records: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=48))
+    fallback_overuse_repair_step: int = -999
+    repair_action_candidates: list[dict[str, Any]] = field(default_factory=list)
+    vlm_repair_choice: dict[str, Any] = field(default_factory=dict)
+    last_repair_vlm_reason: str = ""
+    last_repair_vlm_step: int = -999
+    anti_loop_escape_failures: int = 0
+    last_anti_loop_escape_failure_step: int = -999
+    decision_frames: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=120))
+    last_compile_failures: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=40))
     active_strategy_rule_id: str = ""
     active_near_success_route_id: str = ""
     target_failure_counts: dict[str, int] = field(default_factory=dict)
@@ -1244,6 +1357,7 @@ class LevelMemory:
     vlm_calls_this_level: int = 0
     vlm_invalid_streak: int = 0
     total_action_count: int = 0
+    controller_tick_count: int = 0
     life_action_count: int = 0
     action_trace: deque[str] = field(default_factory=lambda: deque(maxlen=360))
     failed_lives: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=8))
@@ -1272,6 +1386,8 @@ class LevelMemory:
     last_recovery_source: str = ""
     last_recovery_reasoning: dict[str, Any] = field(default_factory=dict)
     recovery_until_step: int = 0
+    terminal_reset_streak: int = 0
+    no_safe_recovery_streak: int = 0
     fallback_recent_keys: deque[str] = field(default_factory=lambda: deque(maxlen=12))
     blocked_state_action_pairs: set[tuple[str, str]] = field(default_factory=set)
     level_theories: list[LevelTheory] = field(default_factory=list)
@@ -1287,6 +1403,7 @@ class AgentRuntimeMemory:
     level: LevelMemory = field(default_factory=LevelMemory)
     event_log: list[EventRecord] = field(default_factory=list)
     next_event_id: int = 1
+    evicted_event_id_through: int = 0
 
 
 def _bbox_area(box: tuple[int, int, int, int]) -> int:
@@ -2350,7 +2467,7 @@ class DecisionLogger:
             try:
                 root = Path(config.log_dir)
                 root.mkdir(parents=True, exist_ok=True)
-                self.path = root / f"agent_v1_6_{int(time.time())}_{os.getpid()}.jsonl"
+                self.path = root / f"agent_v1_7_{int(time.time())}_{os.getpid()}.jsonl"
             except Exception:
                 self.path = None
 
@@ -2655,21 +2772,18 @@ class VLMResult:
     ready_to_solve: bool = False
     plan_goal: str = ""
     target_object_id: str = ""
-    plan: list[dict[str, Any]] = field(default_factory=list)
-    next_action: dict[str, Any] = field(default_factory=dict)
     game_summary: str = ""
     level_summary: str = ""
     mode: str = ""
     grounded_observations: list[str] = field(default_factory=list)
     hypothesis_updates: list[dict[str, Any]] = field(default_factory=list)
-    recommended_experiments: list[dict[str, Any]] = field(default_factory=list)
-    plan_proposals: list[dict[str, Any]] = field(default_factory=list)
     goal_schema_patch: dict[str, Any] = field(default_factory=dict)
     level_instantiation_patch: dict[str, Any] = field(default_factory=dict)
     level_theory_patch: dict[str, Any] = field(default_factory=dict)
     intent_proposals: list[dict[str, Any]] = field(default_factory=list)
     failure_constraints: list[dict[str, Any]] = field(default_factory=list)
     proposed_memory_patch: dict[str, Any] = field(default_factory=dict)
+    decision: dict[str, Any] = field(default_factory=dict)
 
 
 def _short_string(value: Any, limit: int = 300) -> str:
@@ -2743,6 +2857,67 @@ def _balanced_objects(text: str) -> list[str]:
     return objects
 
 
+def _repair_truncated_json(text: str) -> str | None:
+    """Best-effort recovery of a JSON object that was cut off mid-generation.
+
+    VLM outputs frequently hit the token cap before closing the JSON, leaving an
+    unbalanced object that neither `_balanced_objects` nor `json.loads` can read.
+    We close the dangling string/brackets and drop a trailing incomplete pair so
+    the already-completed fields (observations, object_updates, an early plan...)
+    can still be salvaged into a structured result instead of being discarded.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+    fragment = text[start:]
+    in_string = False
+    escape = False
+    quote = ""
+    stack: list[str] = []
+    for char in fragment:
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == quote:
+                in_string = False
+            continue
+        if char in {'"', "'"}:
+            in_string = True
+            quote = char
+        elif char == "{":
+            stack.append("}")
+        elif char == "[":
+            stack.append("]")
+        elif char in {"}", "]"} and stack:
+            stack.pop()
+    if not stack and not in_string:
+        return None
+    repaired = fragment
+    if in_string:
+        repaired += quote
+    repaired = repaired.rstrip()
+
+    def close(candidate: str) -> str:
+        candidate = re.sub(r",\s*$", "", candidate.rstrip())
+        return candidate + "".join(reversed(stack))
+
+    closed = close(repaired)
+    try:
+        json.loads(closed)
+        return closed
+    except Exception:
+        pass
+
+    # Drop a dangling "key": or "key" with no value (a key emitted right before
+    # the cutoff). We try this only after simple closing fails so truncated
+    # string values such as {"observations":["foo are preserved.
+    repaired = re.sub(r'(?:,\s*)?"(?:[^"\\]|\\.)*"\s*:\s*$', "", repaired).rstrip()
+    repaired = re.sub(r'(?:,\s*)?"(?:[^"\\]|\\.)*"\s*$', "", repaired).rstrip()
+    return close(repaired)
+
+
 def _parse_payload(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, dict):
         return raw
@@ -2769,6 +2944,17 @@ def _parse_payload(raw: Any) -> dict[str, Any] | None:
                 pass
             try:
                 value = ast.literal_eval(repaired)
+                if isinstance(value, dict):
+                    return value
+            except Exception:
+                pass
+    # Last resort: the largest candidate is likely a truncated object; try to
+    # close it so completed fields are recoverable instead of dropping everything.
+    closed = _repair_truncated_json(candidates[0])
+    if closed:
+        for repaired in (closed, re.sub(r",\s*([}\]])", r"\1", closed)):
+            try:
+                value = json.loads(repaired)
                 if isinstance(value, dict):
                     return value
             except Exception:
@@ -2849,11 +3035,16 @@ def _regex_action_plan(raw: str) -> list[dict[str, Any]]:
 def parse_vlm_result(raw: Any) -> VLMResult | None:
     payload = _parse_payload(raw)
     if payload is None:
-        if isinstance(raw, str):
-            fallback_plan = _regex_action_plan(raw)
-            if fallback_plan:
-                return VLMResult(plan=fallback_plan, next_action=fallback_plan[0])
+        if isinstance(raw, str) and _short_string(raw, 1):
+            excerpt = _short_string(raw, 1500)
+            return VLMResult(
+                observations=[_short_string(raw, 700)],
+                proposed_memory_patch={"raw_invalid_vlm_excerpt": excerpt},
+                mode="INVALID_PARTIAL",
+            )
         return None
+
+    _normalize_legacy_vlm_payload(payload)
 
     def string_list(key: str, limit: int) -> list[str]:
         value = payload.get(key)
@@ -2885,20 +3076,6 @@ def parse_vlm_result(raw: Any) -> VLMResult | None:
         value = payload.get(key)
         return dict(value) if isinstance(value, dict) else {}
 
-    raw_plan = payload.get("plan")
-    plan: list[dict[str, Any]] = []
-    if isinstance(raw_plan, list):
-        for item in raw_plan[:48]:
-            safe = _safe_action_dict(item)
-            if safe is not None:
-                plan.append(safe)
-    elif isinstance(raw_plan, str):
-        plan = _regex_action_plan(raw_plan)
-
-    next_action = _safe_action_dict(payload.get("next_action")) or {}
-    if not plan and next_action:
-        plan = [next_action]
-
     goal = payload.get("goal_update") if isinstance(payload.get("goal_update"), dict) else {}
     safe_goal = {
         "claim": _short_string(goal.get("claim"), 320),
@@ -2927,7 +3104,7 @@ def parse_vlm_result(raw: Any) -> VLMResult | None:
     target = _short_string(
         payload.get("target_object_id")
         or payload.get("plan_target_id")
-        or (plan[0].get("target_object_id") if plan else ""),
+        or "",
         24,
     ).upper()
 
@@ -2944,22 +3121,137 @@ def parse_vlm_result(raw: Any) -> VLMResult | None:
         ready_to_solve=bool(payload.get("ready_to_solve", False)),
         plan_goal=_short_string(payload.get("plan_goal"), 320),
         target_object_id=target,
-        plan=plan,
-        next_action=next_action,
         game_summary=_short_string(payload.get("game_summary"), 700),
         level_summary=_short_string(payload.get("level_summary"), 700),
         mode=_short_string(payload.get("mode"), 60),
         grounded_observations=string_list("grounded_observations", 12),
         hypothesis_updates=dict_list("hypothesis_updates", 12),
-        recommended_experiments=dict_list("recommended_experiments", 8),
-        plan_proposals=dict_list("plan_proposals", 12),
         goal_schema_patch=safe_dict("goal_schema_patch"),
         level_instantiation_patch=safe_dict("level_instantiation_patch"),
         level_theory_patch=safe_dict("level_theory") or safe_dict("level_theory_patch"),
         intent_proposals=dict_list("intent_proposals", 12) or dict_list("intents", 12),
         failure_constraints=dict_list("failure_constraints", 12),
         proposed_memory_patch=safe_dict("proposed_memory_patch"),
+        decision=safe_dict("decision"),
     )
+
+
+_DECISION_SINGLE_KINDS = {"single_experiment", "single_step", "experiment", "action", "next_action"}
+_DECISION_PLAN_KINDS = {"plan_candidate", "candidate_plan", "plan"}
+
+
+def _normalize_legacy_vlm_payload(payload: dict[str, Any]) -> None:
+    """Fold deprecated top-level VLM fields into the V1.7 decision contract once."""
+    decision = payload.get("decision")
+    if not isinstance(decision, dict):
+        decision = {}
+        payload["decision"] = decision
+    kind = _short_string(decision.get("kind"), 80).lower()
+    protected_kinds = _DECISION_PLAN_KINDS | {"repair_decision", "memory_update_only"}
+
+    next_action = payload.get("next_action")
+    if isinstance(next_action, dict) and next_action and kind not in _DECISION_SINGLE_KINDS | protected_kinds:
+        decision.setdefault("kind", "single_experiment")
+        decision.setdefault("intents", [next_action])
+
+    experiments = payload.get("recommended_experiments")
+    if isinstance(experiments, list) and experiments:
+        payload.setdefault("intent_proposals", experiments)
+        kind = _short_string(decision.get("kind"), 80).lower()
+        if kind not in _DECISION_SINGLE_KINDS | protected_kinds:
+            decision["kind"] = "single_experiment"
+            decision.setdefault("intents", experiments[:4])
+
+    kind = _short_string(decision.get("kind"), 80).lower()
+    if kind not in protected_kinds:
+        for key in ("plan", "plan_proposals"):
+            steps = payload.get(key)
+            if isinstance(steps, list) and steps:
+                decision["kind"] = "plan_candidate"
+                decision.setdefault("steps", steps)
+                decision.setdefault(
+                    "goal",
+                    _short_string(payload.get("plan_goal"), 320) or key,
+                )
+                break
+
+
+def _decision_kind(decision: dict[str, Any]) -> str:
+    if not isinstance(decision, dict):
+        return ""
+    return _short_string(decision.get("kind"), 80).lower()
+
+
+def _coerce_decision_item(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and _short_string(value, 180):
+        return {"action": _short_string(value, 180)}
+    return None
+
+
+def _decision_items_from_keys(
+    decision: dict[str, Any],
+    keys: Sequence[str],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(decision, dict):
+        return []
+    result: list[dict[str, Any]] = []
+    for key in keys:
+        value = decision.get(key)
+        if isinstance(value, list):
+            for item in value:
+                coerced = _coerce_decision_item(item)
+                if coerced is not None:
+                    result.append(coerced)
+                if len(result) >= limit:
+                    return result
+        else:
+            coerced = _coerce_decision_item(value)
+            if coerced is not None:
+                result.append(coerced)
+                if len(result) >= limit:
+                    return result
+    return result
+
+
+def _decision_action_items(decision: dict[str, Any], limit: int = 12) -> list[dict[str, Any]]:
+    items = _decision_items_from_keys(
+        decision,
+        ("intents", "intent_proposals", "recommended_experiments", "intent", "next_action", "action"),
+        limit=limit,
+    )
+    if not items and any(
+        _has_explicit_value(decision.get(key))
+        for key in ("name", "action", "intent", "intent_type", "target_object_id", "action6_candidate_id", "x", "y")
+    ):
+        item = _coerce_decision_item(decision)
+        if item is not None:
+            items.append(item)
+    return items[:limit]
+
+
+def _decision_plan_items(decision: dict[str, Any], limit: int = 48) -> list[dict[str, Any]]:
+    return _decision_items_from_keys(decision, ("steps", "plan", "actions", "intents"), limit=limit)
+
+
+def _vlm_contract_counts(result: VLMResult) -> dict[str, Any]:
+    decision = result.decision if isinstance(result.decision, dict) else {}
+    kind = _decision_kind(decision)
+    decision_actions = _decision_action_items(decision)
+    decision_plan_steps = _decision_plan_items(decision)
+    experiments = len(decision_actions) if kind in _DECISION_SINGLE_KINDS else 0
+    plan_proposals = len(decision_plan_steps) if kind in _DECISION_PLAN_KINDS else 0
+    return {
+        "experiments": experiments,
+        "plan_proposals": plan_proposals,
+        "intent_proposals": len(result.intent_proposals),
+        "decision_kind": kind,
+        "decision_intents": len(decision_actions),
+        "decision_plan_steps": len(decision_plan_steps),
+    }
 
 
 def _normalize_claim(text: str) -> str:
@@ -3030,7 +3322,7 @@ class MyAgent(_BaseAgent):
                 current_scene = self.observer.analyze_grid(current_scene.grid, current_scene.rgb)
                 self._start_new_level(levels_completed, current_scene)
             elif advanced:
-                transition = self._process_pending_transition(current_scene, latest_frame)
+                transition = self._process_pending_transition(current_scene, latest_frame, cross_level=True)
                 self._record_level_success(current_scene, levels_completed)
                 if state == "WIN":
                     self._done = True
@@ -3061,42 +3353,44 @@ class MyAgent(_BaseAgent):
                 self._on_reset_observed(current_scene)
 
             self._remember_current_state(current_scene)
-            if not self.memory.level.plan:
+            if not self.memory.level.active_plan:
                 self._resume_near_success_route(current_scene, legal)
-            if not self.memory.level.plan:
+            if not self.memory.level.active_plan:
                 self._seed_plan_from_strategy_rules(current_scene, legal)
 
             result: VLMResult | None = None
-            proposals: list[ActionProposal] = []
-            plan_proposal = self._plan_executor_proposal(current_scene, legal)
-            if plan_proposal is not None:
-                proposals.append(plan_proposal)
-            proposals.extend(self._transfer_bootstrap_proposals(current_scene, legal))
-
-            mode = self._choose_vlm_mode(current_scene, transition, legal)
-            if mode is not None:
-                result = self._request_vlm_once(current_scene, transition, legal, mode)
-                if result is not None:
-                    self._apply_vlm_update(result, transition, current_scene, legal)
-                    proposals.extend(self._vlm_result_to_proposals(result, current_scene, legal))
-
-            proposals.extend(self._level_theory_proposals(current_scene, legal))
-            proposals.extend(self._experiment_scheduler_proposals(current_scene, legal))
-            chosen = self._choose_best_proposal(proposals, current_scene, legal, state)
-            selected = self._instantiate_proposal(chosen, current_scene, legal) if chosen else None
-            if selected is not None and chosen and chosen.raw.get("_from_level_plan") and self.memory.level.plan:
-                self.memory.level.plan.popleft()
+            decision = self._begin_decision_frame(current_scene, legal, state, transition)
+            selected = self._try_active_plan_action(current_scene, legal, state, decision)
+            if selected is None:
+                result = self._maybe_request_repair_vlm_update(current_scene, transition, legal, decision, state=state)
+                selected = self._try_repair_action(current_scene, legal, state, decision)
 
             if selected is None:
-                action = self._emergency_safe_action(current_scene, legal, state)
-                proposal = dict(self.memory.level.last_recovery_reasoning)
-                if not proposal:
-                    maybe_reasoning = getattr(action, "reasoning", {})
-                    proposal = maybe_reasoning if isinstance(maybe_reasoning, dict) else {}
-                source = self.memory.level.last_recovery_source or "recovery"
-            else:
-                action, proposal, source = selected
+                mode = self._choose_vlm_mode(current_scene, transition, legal)
+                if mode is not None:
+                    decision["vlm_mode"] = mode.value if isinstance(mode, VLMMode) else str(mode)
+                    result = self._request_vlm_once(current_scene, transition, legal, mode)
+                    if result is not None:
+                        self._apply_vlm_update(result, transition, current_scene, legal)
+                        self._accept_vlm_candidate_plans(result, current_scene, legal, decision)
+                        selected = self._try_vlm_single_action(result, current_scene, legal, state, decision)
 
+            if selected is None:
+                selected = self._try_exploration_action(current_scene, legal, state, decision)
+
+            if selected is None:
+                selected = self._last_safe_recovery_action(current_scene, legal, state, decision)
+
+            if selected is None:
+                self.memory.level.awaiting_reset = True
+                selected = (
+                    self._reset_action(),
+                    {"name": "RESET", "owner": "terminal_reset", "reason": "no_safe_non_reset_action"},
+                    "reset",
+                )
+
+            self._finalize_decision_frame(decision, selected)
+            action, proposal, source = selected
             self._record_returned_action(action, proposal, current_scene, latest_frame, source=source)
             self._advance_stage(result, current_scene)
             return action
@@ -3115,7 +3409,27 @@ class MyAgent(_BaseAgent):
         self.memory.next_event_id = max(self.memory.next_event_id, event.event_id + 1)
         max_len = self.config.max_event_log
         if len(self.memory.event_log) > max_len:
+            evicted = self.memory.event_log[:-max_len]
             del self.memory.event_log[:-max_len]
+            if evicted:
+                evicted_through = max(e.event_id for e in evicted)
+                self.memory.evicted_event_id_through = max(
+                    self.memory.evicted_event_id_through, evicted_through
+                )
+                self._prune_dangling_event_refs(evicted_through)
+
+    def _prune_dangling_event_refs(self, evicted_through: int) -> None:
+        """Event_log is bounded, so ids referenced by active level theories can be
+        evicted and dangle. Drop those references from the live theories so prompts
+        and evidence lists only cite events that still exist. Cross-level schema /
+        outcome evidence ids are left as historical labels (never re-queried)."""
+        for theory in self.memory.level.level_theories:
+            theory.supporting_event_ids = [
+                eid for eid in theory.supporting_event_ids if eid > evicted_through
+            ]
+            theory.contradicting_event_ids = [
+                eid for eid in theory.contradicting_event_ids if eid > evicted_through
+            ]
 
     def _recent_event_prompt(self, limit: int | None = None) -> list[dict[str, Any]]:
         events = self.memory.event_log[-(limit or self.config.max_prompt_events) :]
@@ -3167,6 +3481,46 @@ class MyAgent(_BaseAgent):
             return "interaction"
         return "state_change"
 
+    def _transition_effect_flags(
+        self,
+        before_state: str,
+        after_state: str,
+        report: TransitionReport,
+    ) -> dict[str, Any]:
+        recent_states = list(self.memory.level.recent_state_hashes)
+        state_changed = after_state != before_state
+        state_novel = bool(state_changed and after_state not in recent_states[-8:])
+        movement = bool(report.moved_objects or report.is_simple_translation or report.controlled_candidate_id)
+        structural = bool(report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids)
+        resource_delta = bool(report.counter_delta is not None or report.life_delta is not None)
+        new_object_frontier = bool(report.appeared_object_ids or report.disappeared_object_ids)
+        effectful = bool(
+            not report.effective_noop
+            and (
+                state_changed
+                or movement
+                or structural
+                or report.interaction_event
+                or resource_delta
+                or report.world_changed_cell_count > 0
+            )
+        )
+        frontier = bool(
+            state_novel
+            or new_object_frontier
+            or (effectful and (movement or structural or report.interaction_event or resource_delta))
+        )
+        return {
+            "state_changed": state_changed,
+            "state_novel": state_novel,
+            "new_object_frontier": new_object_frontier,
+            "effectful": effectful,
+            "frontier": frontier,
+            "movement": movement,
+            "structural": structural,
+            "resource_delta": resource_delta,
+        }
+
     def _check_expected_predicates(
         self, predicates: list[dict[str, Any]], report: TransitionReport
     ) -> dict[str, Any]:
@@ -3198,6 +3552,30 @@ class MyAgent(_BaseAgent):
 
     def _action6_key_from_xy(self, x: int, y: int) -> str:
         return f"ACTION6:{int(x)},{int(y)}"
+
+    def _action6_signature(
+        self,
+        scene: SceneSnapshot,
+        x: int,
+        y: int,
+        target_object_id: str = "",
+        candidate_kind: str = "",
+    ) -> Action6Signature:
+        obj = scene.object_by_id(target_object_id) if target_object_id else self._object_at_point(scene, x, y)
+        object_id = obj.track_id if obj is not None else _short_string(target_object_id, 24).upper()
+        return Action6Signature(
+            state_hash=scene.state_hash,
+            x=int(x),
+            y=int(y),
+            object_id=object_id,
+            object_type_key=obj.type_key if obj is not None else "",
+            candidate_kind=_short_string(candidate_kind or "unknown", 60),
+            local_patch_signature=self._local_patch_signature(scene, x, y),
+        )
+
+    def _action6_avoid_keys(self, candidate: Action6Candidate, scene: SceneSnapshot) -> set[str]:
+        sig = self._action6_signature(scene, candidate.x, candidate.y, candidate.target_object_id, candidate.candidate_kind)
+        return {sig.xy_key, sig.exact_key, sig.local_key, candidate.key(), candidate.candidate_id}
 
     def _local_patch_signature(self, scene: SceneSnapshot, x: int, y: int, radius: int = 2) -> str:
         vals: list[int] = []
@@ -3312,8 +3690,9 @@ class MyAgent(_BaseAgent):
         add(None, scene.width // 2, scene.height // 2, "blank_control", -5.0)
         candidates.sort(key=lambda item: (item.prior_score, item.salience), reverse=True)
         final = candidates[: self.config.max_action6_candidates]
-        for idx, candidate in enumerate(final):
-            candidate.candidate_id = f"A6C{idx:02d}"
+        for candidate in final:
+            sig = self._action6_signature(scene, candidate.x, candidate.y, candidate.target_object_id, candidate.candidate_kind)
+            candidate.candidate_id = sig.exact_key.replace("A6E:", "A6_")
         return final
 
     def _action6_candidate_by_id(self, scene: SceneSnapshot, candidate_id: str) -> Action6Candidate | None:
@@ -3325,25 +3704,36 @@ class MyAgent(_BaseAgent):
                 return candidate
         return None
 
-    def _action6_candidate_blocked(self, candidate: Action6Candidate, scene: SceneSnapshot) -> bool:
+    def _action6_candidate_blocked(
+        self,
+        candidate: Action6Candidate,
+        scene: SceneSnapshot,
+        *,
+        ignore_family_disabled: bool = False,
+    ) -> bool:
         level = self.memory.level
+        if self._action_family_disabled("ACTION6") and not ignore_family_disabled:
+            return True
         radius = self.config.action6_noop_radius
+        sig = self._action6_signature(scene, candidate.x, candidate.y, candidate.target_object_id, candidate.candidate_kind)
         for rec in level.action6_memory.records:
-            if rec.cooldown_until_step > level.total_action_count:
-                if (
-                    rec.target_type_key
-                    and candidate.target_type_key
-                    and rec.target_type_key == candidate.target_type_key
-                    and rec.candidate_kind == candidate.candidate_kind
-                    and rec.local_patch_signature == candidate.local_patch_signature
-                ):
+            same_local = (
+                rec.local_patch_signature == sig.local_patch_signature
+                and bool(rec.target_type_key)
+                and rec.target_type_key == sig.object_type_key
+                and rec.candidate_kind == sig.candidate_kind
+            )
+            same_exact = rec.state_hash == sig.state_hash and rec.x == sig.x and rec.y == sig.y
+            if rec.cooldown_until_step > self._controller_step() and (same_local or same_exact):
+                return True
+            if rec.state_hash == sig.state_hash and rec.outcome in {"noop", "nonprogress"}:
+                if rec.x == sig.x and rec.y == sig.y:
                     return True
-            if rec.abstract_state_hash == scene.state_hash and rec.outcome == "noop":
-                if rec.x == candidate.x and rec.y == candidate.y:
+                if same_local:
                     return True
-                if max(abs(rec.x - candidate.x), abs(rec.y - candidate.y)) <= radius:
-                    if rec.local_patch_signature == candidate.local_patch_signature or (
-                        rec.target_type_key and rec.target_type_key == candidate.target_type_key
+                if max(abs(rec.x - sig.x), abs(rec.y - sig.y)) <= radius:
+                    if rec.local_patch_signature == sig.local_patch_signature or (
+                        rec.target_type_key and rec.target_type_key == sig.object_type_key
                     ):
                         return True
         return False
@@ -3457,8 +3847,96 @@ class MyAgent(_BaseAgent):
         return knowledge is not None and knowledge.attempts >= 3
 
     def _reject_plan_quality_gate(self, reason: str, names: Sequence[str]) -> None:
-        self._note_plan_reject(RejectReason.LOOP_RISK, f"{reason}: {list(names)[:12]}")
-        self.memory.level.force_vlm_reason = "plan_rejected_quality_gate"
+        level = self.memory.level
+        level.plan_quality_rejections += 1
+        level.reject_reasons[RejectReason.LOOP_RISK.value] += 1
+        self.memory.game.controller_stats.reject_counts[RejectReason.LOOP_RISK.value] += 1
+        level.force_vlm_reason = "plan_rejected_quality_gate"
+        self.logger.log_event(
+            "plan_quality_rejected",
+            {"reason": reason, "names": list(names)[:12], "level": level.level_index},
+        )
+
+    def _vlm_plan_steps_pass_quality(
+        self,
+        steps: Sequence[dict[str, Any]],
+        scene: SceneSnapshot,
+        target_id: str = "",
+    ) -> bool:
+        proposed = [
+            self._normalize_vlm_action_item(dict(raw))
+            for raw in steps
+            if isinstance(raw, dict)
+        ]
+        if target_id:
+            for item in proposed:
+                if not item.get("target_object_id"):
+                    item["target_object_id"] = target_id
+        names = [
+            _short_string(item.get("name") or item.get("action"), 40).upper()
+            for item in proposed
+        ]
+        loop_reason = self._raw_loop_reason(names)
+        if loop_reason:
+            self._reject_plan_quality_gate(loop_reason, names)
+            return False
+        if self._repeated_single_raw_without_grounding(names):
+            self._reject_plan_quality_gate("repeated_single_global_raw_action", names)
+            return False
+        if len(names) > 6 and "NAVIGATE" not in names:
+            has_grounding = bool(target_id) or any(
+                item.get("target_object_id") or item.get("purpose") or item.get("expected_change")
+                for item in proposed
+            )
+            if not has_grounding:
+                self._reject_plan_quality_gate("long_ungrounded_raw_plan", names)
+                return False
+        if proposed and self._premature_frame_target(proposed[0], scene):
+            rejected_target = _short_string(proposed[0].get("target_object_id"), 24).upper()
+            self._record_target_failure(
+                rejected_target,
+                "framed target pattern mismatches status/template while an untested compact object remains",
+            )
+            self.memory.level.recent_events.append(f"rejected_premature_frame_target={rejected_target}")
+            return False
+        return True
+
+    def _start_deterministic_active_plan(
+        self,
+        source: str,
+        goal: str,
+        target_id: str,
+        steps: list[dict[str, Any]],
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        *,
+        log_event: str,
+        log_payload: dict[str, Any] | None = None,
+    ) -> bool:
+        level = self.memory.level
+        if level.active_plan is not None:
+            return False
+        raw = {
+            "source": source,
+            "goal": goal,
+            "target_object_id": target_id,
+            "steps": steps[: self.config.plan_horizon],
+            "confidence": 0.75,
+            "evidence_level": 1,
+        }
+        plan = self._build_candidate_plan(raw, None, scene, legal)
+        if plan is None or not self._preflight_candidate_plan(plan, scene, legal):
+            return False
+        level.plan_id += 1
+        plan.status = "active"
+        level.active_plan = plan
+        level.plan_goal = goal
+        level.plan_target_id = target_id
+        level.stage = V1Phase.EXECUTE_PLAN
+        payload = {**plan.as_prompt(), **(log_payload or {})}
+        payload.setdefault("plan_id", level.plan_id)
+        self.logger.log_event(log_event, payload)
+        return True
 
     def _select_action6_candidate(
         self,
@@ -3471,16 +3949,19 @@ class MyAgent(_BaseAgent):
         avoid = avoid_keys or set()
         noops = level.noop_actions_by_state.get(scene.state_hash, set())
         attempts = level.action_attempt_counts_by_state.get(scene.state_hash, {})
+        if self._action_family_disabled("ACTION6"):
+            return None
         candidates = self._action6_candidate_objects(scene)
         if not candidates:
             return None
 
         def rank(candidate: Action6Candidate) -> tuple[int, int, int, int, int, float, float]:
             key = self._action6_key_from_xy(candidate.x, candidate.y)
+            avoid_hit = bool(self._action6_avoid_keys(candidate, scene) & avoid)
             return (
                 1 if self._action6_candidate_blocked(candidate, scene) else 0,
                 1 if key in noops else 0,
-                1 if key in avoid or candidate.key() in avoid else 0,
+                1 if avoid_hit else 0,
                 1 if key in level.recent_action_keys else 0,
                 int(attempts.get(key, 0)),
                 -float(candidate.prior_score),
@@ -3490,6 +3971,42 @@ class MyAgent(_BaseAgent):
         for candidate in sorted(candidates, key=rank):
             key = self._action6_key_from_xy(candidate.x, candidate.y)
             if not allow_blocked and (key in noops or self._action6_candidate_blocked(candidate, scene)):
+                continue
+            if not allow_blocked and self._action6_avoid_keys(candidate, scene) & avoid:
+                continue
+            return candidate
+        return None
+
+    def _select_action6_candidate_allowing_state_noops(
+        self,
+        scene: SceneSnapshot,
+        avoid_keys: set[str] | None = None,
+        *,
+        allow_blocked: bool = False,
+    ) -> Action6Candidate | None:
+        if self._action_family_disabled("ACTION6"):
+            return None
+        avoid = avoid_keys or set()
+        noops = self.memory.level.noop_actions_by_state.get(scene.state_hash, set())
+        attempts = self.memory.level.action_attempt_counts_by_state.get(scene.state_hash, {})
+        candidates = self._action6_candidate_objects(scene)
+
+        def rank(candidate: Action6Candidate) -> tuple[int, int, int, int, int, float, float]:
+            key = self._action6_key_from_xy(candidate.x, candidate.y)
+            avoid_hit = bool(self._action6_avoid_keys(candidate, scene) & avoid)
+            blocked = self._action6_candidate_blocked(candidate, scene)
+            return (
+                1 if blocked else 0,
+                1 if key in noops else 0,
+                1 if avoid_hit else 0,
+                1 if key in self.memory.level.recent_action_keys else 0,
+                int(attempts.get(key, 0)),
+                -float(candidate.prior_score),
+                -float(candidate.salience),
+            )
+
+        for candidate in sorted(candidates, key=rank):
+            if not allow_blocked and self._action6_candidate_blocked(candidate, scene):
                 continue
             return candidate
         return None
@@ -3554,8 +4071,21 @@ class MyAgent(_BaseAgent):
                     {"candidate_id": candidate_id, "x": candidate.x, "y": candidate.y, "target_object_id": item.get("target_object_id", "")},
                 )
                 return item
+            self.logger.log_event(
+                "vlm_contract_repair_failed",
+                {"reason": "action6_candidate_id_not_found_or_blocked", "candidate_id": candidate_id},
+            )
+            if not target:
+                candidate_id = ""
 
         if has_any_explicit_coord:
+            return None
+        if not target and not candidate_id:
+            self.memory.game.controller_stats.contract_repairs["bare_action6_no_target_candidate_coord"] += 1
+            self.logger.log_event(
+                "vlm_contract_repair_failed",
+                {"reason": "bare_action6_no_target_candidate_coord", "proposal": _json_safe(item)},
+            )
             return None
 
         candidate = self._select_action6_candidate(scene, avoid_keys=avoid_keys)
@@ -3579,20 +4109,487 @@ class MyAgent(_BaseAgent):
         )
         return item
 
+    def _controller_step(self) -> int:
+        level = self.memory.level
+        return max(level.total_action_count, level.controller_tick_count)
+
+    def _action_family_disabled(self, family: str) -> bool:
+        family = _short_string(family, 40).upper()
+        return self.memory.level.disabled_action_families_until.get(family, 0) > self._controller_step()
+
+    def _disable_action_family(self, family: str, steps: int, reason: str) -> None:
+        family = _short_string(family, 40).upper()
+        until = self._controller_step() + max(1, int(steps))
+        previous = self.memory.level.disabled_action_families_until.get(family, 0)
+        self.memory.level.disabled_action_families_until[family] = max(previous, until)
+        self.logger.log_event(
+            "action_family_disabled",
+            {"family": family, "until": self.memory.level.disabled_action_families_until[family], "reason": reason[:240]},
+        )
+
+    def _primitive_grounding_complete(self, name: str) -> bool:
+        name = _short_string(name, 40).upper()
+        if name not in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"}:
+            return False
+        knowledge = self.memory.game.action_knowledge.get(name)
+        if knowledge is None or knowledge.attempts <= 0:
+            return False
+        if knowledge.attempts >= 2:
+            return True
+        return bool(
+            knowledge.best_vector() is not None
+            or knowledge.blocked > 0
+            or knowledge.structural_successes > 0
+            or knowledge.global_changes > 0
+            or knowledge.retry_failures > 0
+        )
+
+    def _primitive_transition_features(
+        self,
+        pending: PendingAction,
+        report: TransitionReport,
+    ) -> dict[str, Any]:
+        movement = bool(report.moved_objects or report.is_simple_translation or report.controlled_candidate_id)
+        interaction = bool(report.interaction_event)
+        structural_count = (
+            len(report.transformed_objects)
+            + len(report.appeared_object_ids)
+            + len(report.disappeared_object_ids)
+        )
+        resource_cost = bool(
+            (report.counter_delta is not None and report.counter_delta < 0)
+            or (report.life_delta is not None and report.life_delta < 0)
+        )
+        pure_structural = structural_count > 0 and not movement and not interaction
+        low_visual_churn = (
+            report.world_changed_cell_count <= 4
+            and report.changed_cell_count <= 8
+            and not movement
+            and not interaction
+        )
+        global_churn = report.world_changed_cell_count >= 20 and not movement and not interaction
+        suspicious = bool(
+            pending.name in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"}
+            and not report.effective_noop
+            and not report.retry_detected
+            and (pure_structural or global_churn or low_visual_churn or (resource_cost and not movement and not interaction))
+        )
+        return {
+            "action": pending.name,
+            "source": pending.source,
+            "step": self.memory.level.total_action_count,
+            "suspicious": suspicious,
+            "movement": movement,
+            "interaction": interaction,
+            "resource_cost": resource_cost,
+            "structural_count": structural_count,
+            "world_changed_cells": report.world_changed_cell_count,
+            "changed_cells": report.changed_cell_count,
+            "counter_delta": report.counter_delta,
+            "life_delta": report.life_delta,
+            "summary": report.summary[:320],
+        }
+
+    def _detect_nonprogress_primitive_loop(
+        self,
+        pending: PendingAction,
+        report: TransitionReport,
+        current_scene: SceneSnapshot,
+        event: EventRecord,
+    ) -> None:
+        if pending.name not in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"}:
+            return
+        if report.retry_detected or report.effective_noop:
+            return
+        level = self.memory.level
+        record = self._primitive_transition_features(pending, report)
+        level.nonprogress_action_records.append(record)
+        if not record.get("suspicious"):
+            return
+
+        action = pending.name
+        recent = list(level.nonprogress_action_records)[-10:]
+        same = [item for item in recent if item.get("action") == action]
+        suspicious_same = [item for item in same if item.get("suspicious")]
+        resource_same = [item for item in suspicious_same if item.get("resource_cost")]
+        dominant_same = len(same) >= 4 and len(same) >= max(4, len(recent) // 2)
+        should_repair = (
+            len(resource_same) >= 2
+            or len(suspicious_same) >= 3
+            or (dominant_same and len(suspicious_same) >= 2)
+        )
+        if not should_repair:
+            level.suspicious_action_counts[action] += 1
+            return
+        if self._action_family_disabled(action) and level.recovery_mode == "repair_nonprogress_loop":
+            return
+
+        level.suspicious_action_counts[action] += 1
+        level.last_nonprogress_repair_step = self._controller_step()
+        reason = f"nonprogress_primitive_loop:{action}"
+        disable_steps = 10 if resource_same else 8
+        self._disable_action_family(action, disable_steps, reason)
+        level.blocked_state_action_pairs.add((pending.scene_before.state_hash, action))
+        level.blocked_state_action_pairs.add((current_scene.state_hash, action))
+        level.recent_events.append(f"{reason}; recent={[item.get('summary', '')[:80] for item in suspicious_same[-3:]]}")
+        self._enter_repair_mode(reason)
+        self.logger.log_event(
+            "nonprogress_loop_detected",
+            {
+                "action": action,
+                "event_id": event.event_id,
+                "recent_same": len(same),
+                "suspicious_same": len(suspicious_same),
+                "resource_same": len(resource_same),
+                "disabled_until": level.disabled_action_families_until.get(action, 0),
+                "records": suspicious_same[-4:],
+            },
+        )
+
+    def _action6_transition_features(
+        self,
+        pending: PendingAction,
+        report: TransitionReport,
+        current_scene: SceneSnapshot,
+    ) -> dict[str, Any]:
+        before = pending.scene_before
+        level = self.memory.level
+        obj = self._object_at_point(before, int(pending.x or 0), int(pending.y or 0)) if pending.x is not None and pending.y is not None else None
+        candidate_kind = "unknown"
+        for pred in pending.expected_predicates:
+            if isinstance(pred, dict) and pred.get("candidate_kind"):
+                candidate_kind = _short_string(pred.get("candidate_kind"), 60)
+                break
+        movement = bool(report.moved_objects or report.is_simple_translation or report.controlled_candidate_id)
+        interaction = bool(report.interaction_event)
+        structural_count = (
+            len(report.transformed_objects)
+            + len(report.appeared_object_ids)
+            + len(report.disappeared_object_ids)
+        )
+        resource_cost = bool(
+            (report.counter_delta is not None and report.counter_delta < 0)
+            or (report.life_delta is not None and report.life_delta < 0)
+        )
+        state_changed = current_scene.state_hash != before.state_hash
+        state_novel = bool(state_changed and current_scene.state_hash not in list(level.recent_state_hashes)[-8:])
+        new_object_frontier = bool(report.appeared_object_ids or report.disappeared_object_ids)
+        low_visual_churn = (
+            report.world_changed_cell_count <= 4
+            and report.changed_cell_count <= 8
+            and not movement
+            and not interaction
+        )
+        pure_structural = structural_count > 0 and not movement and not interaction
+        frontier = bool(state_novel or new_object_frontier)
+        suspicious = bool(
+            pending.name == "ACTION6"
+            and not report.retry_detected
+            and (
+                report.effective_noop
+                or low_visual_churn
+                or (resource_cost and not movement and not interaction)
+                or (pure_structural and not frontier)
+            )
+        )
+        local_patch = ""
+        if pending.x is not None and pending.y is not None:
+            local_patch = self._local_patch_signature(before, pending.x, pending.y)
+        return {
+            "action": "ACTION6",
+            "source": pending.source,
+            "step": self.memory.level.total_action_count,
+            "state_hash": before.state_hash,
+            "x": pending.x,
+            "y": pending.y,
+            "target_object_id": obj.track_id if obj else pending.target_object_id,
+            "target_type_key": obj.type_key if obj else "",
+            "candidate_kind": candidate_kind,
+            "local_patch_signature": local_patch,
+            "suspicious": suspicious,
+            "state_changed": state_changed,
+            "state_frontier": state_novel,
+            "new_object_frontier": new_object_frontier,
+            "pure_structural": pure_structural,
+            "movement": movement,
+            "interaction": interaction,
+            "resource_cost": resource_cost,
+            "structural_count": structural_count,
+            "world_changed_cells": report.world_changed_cell_count,
+            "changed_cells": report.changed_cell_count,
+            "counter_delta": report.counter_delta,
+            "life_delta": report.life_delta,
+            "summary": report.summary[:320],
+        }
+
+    def _detect_action6_nonprogress_loop(
+        self,
+        pending: PendingAction,
+        report: TransitionReport,
+        current_scene: SceneSnapshot,
+        event: EventRecord,
+    ) -> None:
+        if pending.name != "ACTION6" or pending.x is None or pending.y is None:
+            return
+        level = self.memory.level
+        record = self._action6_transition_features(pending, report, current_scene)
+        level.nonprogress_action_records.append(record)
+        if not record.get("suspicious"):
+            return
+
+        recent = [
+            item for item in list(level.nonprogress_action_records)[-14:]
+            if item.get("action") == "ACTION6"
+        ]
+        suspicious = [
+            item for item in recent
+            if item.get("suspicious")
+            and not item.get("state_frontier")
+            and not item.get("new_object_frontier")
+        ]
+        same_local = [
+            item for item in suspicious
+            if item.get("local_patch_signature") == record.get("local_patch_signature")
+            and item.get("target_type_key") == record.get("target_type_key")
+            and item.get("candidate_kind") == record.get("candidate_kind")
+        ]
+        same_exact = [
+            item for item in suspicious
+            if item.get("state_hash") == record.get("state_hash")
+            and item.get("x") == record.get("x")
+            and item.get("y") == record.get("y")
+        ]
+        local_families = {
+            (
+                item.get("local_patch_signature"),
+                item.get("target_type_key"),
+                item.get("candidate_kind"),
+            )
+            for item in suspicious
+        }
+        should_repair = len(same_exact) >= 2 or len(same_local) >= 3 or (len(suspicious) >= 4 and len(local_families) <= 2)
+        if not should_repair:
+            return
+        if self._controller_step() - level.last_nonprogress_repair_step < 3 and level.recovery_mode:
+            return
+
+        cooldown_until = self._controller_step() + 10
+        for rec in level.action6_memory.records[-30:]:
+            same_rec_local = (
+                rec.local_patch_signature == record.get("local_patch_signature")
+                and rec.target_type_key == record.get("target_type_key")
+                and rec.candidate_kind == record.get("candidate_kind")
+            )
+            same_rec_exact = (
+                rec.state_hash == record.get("state_hash")
+                and rec.x == record.get("x")
+                and rec.y == record.get("y")
+            )
+            if same_rec_local or same_rec_exact:
+                rec.cooldown_until_step = max(rec.cooldown_until_step, cooldown_until)
+                if rec.outcome != "noop":
+                    rec.outcome = "nonprogress"
+
+        key = self._action6_key_from_xy(pending.x, pending.y)
+        level.blocked_state_action_pairs.add((pending.scene_before.state_hash, key))
+        level.blocked_state_action_pairs.add((current_scene.state_hash, key))
+        level.last_nonprogress_repair_step = self._controller_step()
+        only_action6 = self._action6_is_only_forward_name_set(pending.available_actions_before)
+        reason = "click_candidate_nonprogress_loop" if only_action6 else "action6_nonprogress_loop"
+        level.recent_events.append(
+            f"{reason}; recent={[item.get('summary', '')[:80] for item in suspicious[-3:]]}"
+        )
+        self._enter_repair_mode(reason)
+        self.logger.log_event(
+            "action6_nonprogress_loop_detected",
+            {
+                "event_id": event.event_id,
+                "only_action6_forward": only_action6,
+                "recent_action6": len(recent),
+                "suspicious": len(suspicious),
+                "same_local": len(same_local),
+                "same_exact": len(same_exact),
+                "blocked_key": key,
+                "cooldown_until": cooldown_until,
+                "records": suspicious[-4:],
+            },
+        )
+
+    def _action6_is_only_forward_name_set(self, names: Sequence[str]) -> bool:
+        normalized = {_short_string(name, 40).upper() for name in names}
+        if "ACTION6" not in normalized:
+            return False
+        return not any(
+            name in normalized for name in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5")
+        )
+
+    def _action6_is_only_forward_action(self, legal: Sequence[Any]) -> bool:
+        names = [action_name(action) for action in legal]
+        return self._action6_is_only_forward_name_set(names)
+
+    def _action6_budget_available(self, legal: Sequence[Any] | None = None) -> bool:
+        # When ACTION6 is the only forward action, throttling it would deadlock
+        # the controller into an endless RESET storm (no other legal action can
+        # ever be proposed), so the budget must not apply in that case.
+        if legal is not None and self._action6_is_only_forward_action(legal):
+            return True
+        if self._action_family_disabled("ACTION6"):
+            return False
+        recent = list(self.memory.level.recent_action_keys)[-8:]
+        return sum(1 for item in recent if item.startswith("ACTION6")) < 2
+
+    def _classify_recovery_mode(self, reason: str) -> str:
+        text = str(reason).lower()
+        if "action6" in text:
+            return "escape_from_action6_loop"
+        if "nonprogress" in text or "resource" in text or "undo" in text or "fallback" in text:
+            return "repair_nonprogress_loop"
+        if "nav" in text or "compile" in text:
+            return "repair_compile_failure"
+        if "retry" in text or "game_over" in text:
+            return "recover_after_retry"
+        return "proposal_recovery"
+
+    def _enter_repair_mode(self, reason: str) -> None:
+        level = self.memory.level
+        mode = self._classify_recovery_mode(reason)
+        normalized_reason = _short_string(reason, 240)
+        current_step = self._controller_step()
+        if (
+            level.recovery_mode == mode
+            and level.recovery_reason == normalized_reason
+            and current_step <= level.recovery_until_step
+        ):
+            return
+        level.recovery_mode = mode
+        level.recovery_reason = normalized_reason
+        level.recovery_until_step = max(level.recovery_until_step, current_step + 8)
+        level.force_vlm_reason = "repair_decision"
+        if level.recovery_mode == "escape_from_action6_loop":
+            level.anti_loop_escape_failures = 0
+            self._disable_action_family("ACTION6", 8, reason)
+        else:
+            level.anti_loop_escape_failures = 0
+        self.memory.game.controller_stats.recovery_counts[level.recovery_mode] += 1
+        self.logger.log_event(
+            "repair_mode_entered",
+            {"mode": level.recovery_mode, "reason": level.recovery_reason, "until": level.recovery_until_step},
+        )
+
+    def _proposal_summary(self, proposal: ActionProposal | None) -> dict[str, Any]:
+        if proposal is None:
+            return {}
+        return {
+            "source": proposal.source,
+            "action": proposal.action_key(),
+            "target_object_id": proposal.target_object_id,
+            "purpose": proposal.purpose[:240],
+            "priority": round(float(proposal.priority), 4),
+            "information_gain": round(float(proposal.information_gain), 4),
+            "goal_progress": round(float(proposal.goal_progress), 4),
+            "raw": _json_safe(proposal.raw),
+        }
+
+    def _active_plan_prompt(self) -> dict[str, Any]:
+        plan = self.memory.level.active_plan
+        return plan.as_prompt() if plan is not None else {}
+
+    def _begin_decision_frame(
+        self,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        state: str,
+        transition: TransitionReport | None,
+    ) -> dict[str, Any]:
+        level = self.memory.level
+        return {
+            "decision_id": self._call_index,
+            "level": level.level_index,
+            "step": level.total_action_count,
+            "state": scene.state_hash[:12],
+            "phase": level.stage.value,
+            "state_name": state,
+            "legal": [action_name(action) for action in legal],
+            "owner_attempts": [],
+            "vlm_mode": "",
+            "active_plan": self._active_plan_prompt(),
+            "recovery": {
+                "mode": level.recovery_mode,
+                "reason": level.recovery_reason,
+                "until": level.recovery_until_step,
+            },
+            "candidates": [],
+            "compile_failures": [],
+            "scored": [],
+            "selected": {},
+            "transition": transition.summary if transition is not None else None,
+        }
+
+    def _record_compile_result(
+        self,
+        decision: dict[str, Any] | None,
+        compiled: CompileResult,
+        *,
+        owner: str,
+    ) -> None:
+        if compiled.ok:
+            if decision is not None and compiled.proposal is not None:
+                decision.setdefault("candidates", []).append(
+                    {"owner": owner, "proposal": self._proposal_summary(compiled.proposal), "compile_status": compiled.status.value}
+                )
+            return
+        entry = {
+            "owner": owner,
+            "status": compiled.status.value,
+            "detail": compiled.detail[:300],
+            "severity": compiled.severity,
+            "intent": _json_safe(compiled.intent),
+        }
+        self.memory.level.last_compile_failures.append(entry)
+        self._record_compile_target_failure(compiled)
+        if (
+            owner != "active_plan"
+            and compiled.intent.intent_type == IntentType.NAVIGATE_TO_OBJECT.value
+            and compiled.status
+            in {
+                CompileStatus.ACTOR_UNKNOWN,
+                CompileStatus.ACTION_VECTORS_UNKNOWN,
+                CompileStatus.WALKABLE_UNKNOWN,
+                CompileStatus.NO_PATH_KNOWN,
+            }
+        ):
+            self._enter_repair_mode(f"nav_compile_failed:{compiled.status.value}")
+        if decision is not None:
+            decision.setdefault("compile_failures", []).append(entry)
+
+    def _record_compile_target_failure(self, compiled: CompileResult) -> None:
+        if compiled.ok or compiled.status is None:
+            return
+        target_id = compiled.intent.target_object_id
+        if not target_id or compiled.intent.intent_type != IntentType.NAVIGATE_TO_OBJECT.value:
+            return
+        if compiled.status in {
+            CompileStatus.TARGET_BLOCKED,
+            CompileStatus.TARGET_NOT_VISIBLE,
+        }:
+            self._record_target_failure(target_id, f"nav_compile:{compiled.status.value}")
+
+    def _finalize_decision_frame(self, frame: dict[str, Any], selected: tuple[Any, dict[str, Any], str] | None) -> None:
+        if selected is not None:
+            action, proposal, source = selected
+            frame["selected"] = {
+                "owner": proposal.get("owner") or source,
+                "source": source,
+                "action": self._action_key_for_action(action),
+                "proposal": _json_safe(proposal),
+            }
+        else:
+            frame["selected"] = {"owner": "none"}
+        self.memory.level.decision_frames.append(frame)
+        self.logger.log_event("decision_frame", frame)
+
     def _risk_value(self, risk: str) -> float:
         return {"low": 0.0, "medium": 0.35, "high": 1.0}.get(str(risk).lower(), 0.3)
-
-    def _note_plan_reject(self, reason: RejectReason, detail: str = "") -> None:
-        level = self.memory.level
-        level.plan_quality_rejections += 1
-        level.reject_reasons[reason.value] += 1
-        self.memory.game.controller_stats.reject_counts[reason.value] += 1
-        if reason == RejectReason.ACTION7_UNDO_ONLY:
-            self.memory.game.controller_stats.action7_forbidden_count += 1
-        self.logger.log_event(
-            "plan_quality_rejected",
-            {"reason": reason.value, "detail": detail[:300], "level": level.level_index},
-        )
 
     def _compile_reject_reason(self, status: CompileStatus | None) -> RejectReason:
         return {
@@ -3657,6 +4654,7 @@ class MyAgent(_BaseAgent):
                 proposal.target_object_id = compiled.proposal.target_object_id
                 name = proposal.action_name
             else:
+                self._record_compile_result(None, compiled, owner=proposal.source or "proposal")
                 return reject(self._compile_reject_reason(compiled.status), compiled.detail)
         if name == "RESET":
             if state not in {"NOT_PLAYED", "GAME_OVER", "WIN"}:
@@ -3667,11 +4665,23 @@ class MyAgent(_BaseAgent):
                 return reject(RejectReason.ACTION7_UNDO_ONLY)
         if name not in legal_by_name:
             return reject(RejectReason.ILLEGAL_ACTION, f"{name} not in {sorted(legal_by_name)}")
+        allow_disabled_action6_frontier = bool(
+            name == "ACTION6"
+            and proposal.source == "action6_frontier"
+            and proposal.raw.get("family_disabled_bypass")
+        )
+        if self._action_family_disabled(name) and not allow_disabled_action6_frontier:
+            return reject(RejectReason.LOOP_RISK, f"{name} family disabled until {self.memory.level.disabled_action_families_until.get(name, 0)}")
         if name == "ACTION6":
             if proposal.x is None or proposal.y is None or not (0 <= proposal.x < scene.width and 0 <= proposal.y < scene.height):
                 return reject(RejectReason.ACTION6_BAD_COORD)
             candidate = self._proposal_to_action6_candidate(proposal, scene)
-            if candidate is not None and self._action6_candidate_blocked(candidate, scene):
+            ignore_candidate_block = bool(allow_disabled_action6_frontier)
+            if candidate is not None and not ignore_candidate_block and self._action6_candidate_blocked(
+                candidate,
+                scene,
+                ignore_family_disabled=allow_disabled_action6_frontier,
+            ):
                 level.action6_memory.duplicate_suppressed += 1
                 self.memory.game.controller_stats.action6_duplicate_suppressed += 1
                 self.logger.log_event("action6_candidate_suppressed", {"candidate": _json_safe(candidate), "state": scene.state_hash[:12]})
@@ -3689,35 +4699,92 @@ class MyAgent(_BaseAgent):
             self.logger.log_event("loop_soft_penalty", {"action": key, "penalty": soft_penalty, "level": level.level_index, "step": level.total_action_count})
         if self.memory.game.failure_model.forbids(list(level.recent_action_keys), key):
             return reject(RejectReason.FAILURE_SUFFIX)
-        if proposal.target_object_id and self._target_blocked(proposal.target_object_id, scene):
+        if name == "ACTION6" and proposal.target_object_id and self._target_blocked(proposal.target_object_id, scene):
             return reject(RejectReason.TARGET_BLOCKED)
         return ValidationResult(True, proposal)
 
+    def _history_penalty(self, p: ActionProposal, scene: SceneSnapshot) -> float:
+        level = self.memory.level
+        key = p.action_key()
+        if key in level.noop_actions_by_state.get(scene.state_hash, set()):
+            return 999.0
+        penalty = 1.2 * level.action_attempt_counts_by_state.get(scene.state_hash, {}).get(key, 0)
+        if p.target_object_id:
+            penalty += 1.5 * level.target_failure_counts.get(p.target_object_id, 0)
+        allow_disabled_action6_frontier = bool(
+            p.action_name == "ACTION6"
+            and p.source == "action6_frontier"
+            and p.raw.get("family_disabled_bypass")
+        )
+        if self._action_family_disabled(p.action_name) and not allow_disabled_action6_frontier:
+            return 999.0
+        if p.action_name in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"}:
+            recent_suspicious = [
+                item for item in list(level.nonprogress_action_records)[-12:]
+                if item.get("action") == p.action_name and item.get("suspicious")
+            ]
+            penalty += 1.25 * len(recent_suspicious)
+            penalty += 1.5 * min(3, level.suspicious_action_counts.get(p.action_name, 0))
+        if p.action_name == "ACTION6" and p.x is not None and p.y is not None:
+            sig = self._action6_signature(scene, p.x, p.y, p.target_object_id, p.raw.get("candidate_kind", ""))
+            for rec in level.action6_memory.records[-80:]:
+                if rec.outcome not in {"noop", "nonprogress"}:
+                    continue
+                if rec.x == sig.x and rec.y == sig.y and rec.state_hash == sig.state_hash:
+                    penalty += 4.0
+                elif rec.local_patch_signature == sig.local_patch_signature and rec.target_type_key == sig.object_type_key:
+                    penalty += 2.0
+            for item in list(level.nonprogress_action_records)[-80:]:
+                if item.get("action") != "ACTION6" or not item.get("suspicious"):
+                    continue
+                if item.get("x") == sig.x and item.get("y") == sig.y and item.get("state_hash") == sig.state_hash:
+                    penalty += 3.0
+                elif (
+                    item.get("local_patch_signature") == sig.local_patch_signature
+                    and item.get("target_type_key") == sig.object_type_key
+                    and item.get("candidate_kind") == sig.candidate_kind
+                ):
+                    penalty += 1.5
+            recent_family = sum(1 for action in list(level.recent_action_keys)[-8:] if action.startswith("ACTION6"))
+            penalty += 0.6 * recent_family
+            if self._action_family_disabled("ACTION6") and not allow_disabled_action6_frontier:
+                penalty += 999.0
+        return penalty
+
     def _score_proposal(self, result: ValidationResult, scene: SceneSnapshot) -> ValidationResult:
         p = result.proposal
-        schema_support = 1.0 if p.source in {"schema_transfer", "vlm_transfer", "plan_executor"} else 0.0
+        schema_support = 1.0 if p.source in {"schema_transfer", "vlm_transfer", "active_plan"} else 0.0
         try:
             loop_risk = float(p.raw.get("loop_soft_penalty", 0.0) or 0.0)
         except Exception:
             loop_risk = 0.0
         terminal_risk = self._risk_value(p.risk)
         irreversibility = 0.0 if p.reversible else (0.2 if p.risk == "low" else 0.5)
+        history_penalty = self._history_penalty(p, scene)
+        plan_bonus = 0.6 if p.raw.get("_from_active_plan") else 0.0
         score = (
             2.5 * p.information_gain
             + 2.0 * p.goal_progress
             + 1.2 * schema_support
             + 0.8 * p.novelty
             + p.priority
+            + plan_bonus
             - 1.0 * p.cost
             - 3.0 * terminal_risk
             - 2.0 * irreversibility
             - 4.0 * loop_risk
+            - history_penalty
         )
         result.score = round(score, 4)
         return result
 
     def _choose_best_proposal(
-        self, proposals: list[ActionProposal], scene: SceneSnapshot, legal: Sequence[Any], state: str
+        self,
+        proposals: list[ActionProposal],
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        state: str,
+        decision: dict[str, Any] | None = None,
     ) -> ActionProposal | None:
         stats = self.memory.game.controller_stats
         valid: list[ValidationResult] = []
@@ -3725,7 +4792,18 @@ class MyAgent(_BaseAgent):
             stats.proposal_counts[proposal.source] += 1
             result = self._validate_proposal(proposal, scene, legal, state)
             if result.ok:
-                valid.append(self._score_proposal(result, scene))
+                scored = self._score_proposal(result, scene)
+                valid.append(scored)
+                if decision is not None:
+                    decision.setdefault("scored", []).append({**self._proposal_summary(scored.proposal), "score": scored.score})
+            elif decision is not None:
+                decision.setdefault("candidates", []).append(
+                    {
+                        "proposal": self._proposal_summary(result.proposal),
+                        "reject": result.reason.value if result.reason is not None else "unknown",
+                        "detail": result.detail[:240],
+                    }
+                )
         if not valid:
             return None
         valid.sort(key=lambda item: (item.score, item.proposal.priority, item.proposal.information_gain), reverse=True)
@@ -3754,55 +4832,6 @@ class MyAgent(_BaseAgent):
         if action is None:
             return None
         return action, step, proposal.source
-
-    def _proposal_from_legacy_step(
-        self, step: dict[str, Any], source: str, phase: V1Phase, priority: float
-    ) -> ActionProposal | None:
-        name = _short_string(step.get("name") or step.get("action"), 40).upper()
-        if not name:
-            return None
-        expected = step.get("expected_predicates") if isinstance(step.get("expected_predicates"), list) else []
-        if not expected and step.get("expected_change"):
-            expected = [{"type": "summary", "summary": _short_string(step.get("expected_change"), 260)}]
-        return ActionProposal(
-            source=source,
-            action_name=name,
-            x=self._coerce_int(step.get("x")),
-            y=self._coerce_int(step.get("y")),
-            target_object_id=_short_string(step.get("target_object_id"), 24).upper(),
-            purpose=_short_string(step.get("purpose"), 260),
-            phase=phase,
-            expected_predicates=expected[:8],
-            risk=_short_string(step.get("risk"), 20).lower() or "low",
-            reversible=bool(step.get("reversible", False)),
-            information_gain=_clamp01(step.get("information_gain", 0.2)),
-            goal_progress=_clamp01(step.get("goal_progress", 0.0)),
-            novelty=0.1,
-            priority=priority,
-            raw=dict(step),
-        )
-
-    def _plan_executor_proposal(self, scene: SceneSnapshot, legal: Sequence[Any]) -> ActionProposal | None:
-        level = self.memory.level
-        while level.plan:
-            step = level.plan[0]
-            name = _short_string(step.get("name"), 40).upper()
-            target = _short_string(step.get("target_object_id"), 24).upper()
-            if name == "NAVIGATE" and target:
-                if self._target_blocked(target, scene):
-                    level.plan.popleft()
-                    continue
-                actor = scene.object_by_id(level.controlled_object_id)
-                tgt = scene.object_by_id(target)
-                if actor is not None and tgt is not None and self._object_reached(actor, tgt):
-                    level.plan.popleft()
-                    continue
-            source = "vlm_plan" if step.get("source") == "vlm_plan" else "plan_executor"
-            proposal = self._proposal_from_legacy_step(step, source, V1Phase.EXECUTE_PLAN, 0.4)
-            if proposal is not None:
-                proposal.raw["_from_level_plan"] = True
-            return proposal
-        return None
 
     def _nav_reject_reason(
         self,
@@ -3848,17 +4877,36 @@ class MyAgent(_BaseAgent):
         if not level.level_theories:
             return []
         theory = level.level_theories[0]
-        if theory.status == "rejected" or theory.confidence < 0.25:
+        if theory.status == "rejected" or theory.confidence < 0.25 or theory.evidence_level <= 0:
             return []
-        raw_intents: list[dict[str, Any]] = []
-        raw_intents.extend(item for item in theory.discriminating_tests[:4] if isinstance(item, dict))
-        if theory.confidence >= 0.45:
-            raw_intents.extend(item for item in theory.solve_sketch[:4] if isinstance(item, dict))
+        raw_intents: list[dict[str, Any]] = [
+            item for item in theory.discriminating_tests[:2] if isinstance(item, dict)
+        ]
+        if theory.evidence_level >= 2 and theory.confidence >= 0.55 and theory.solve_sketch:
+            plan = self._build_candidate_plan(
+                {
+                    "source": "level_theory",
+                    "goal": theory.win_condition_hypothesis or theory.mechanism_hypothesis,
+                    "steps": theory.solve_sketch[: self.config.plan_horizon],
+                    "confidence": min(0.75, theory.confidence),
+                    "evidence_level": theory.evidence_level,
+                    "theory_id": theory.theory_id,
+                },
+                None,
+                scene,
+                legal,
+            )
+            if plan is not None and self._preflight_candidate_plan(plan, scene, legal):
+                if not any(existing.plan_id == plan.plan_id for existing in level.candidate_plans):
+                    level.candidate_plans.append(plan)
+                    self.logger.log_event("candidate_plan_created", plan.as_prompt())
         intents: list[ActionIntent] = []
         for raw in raw_intents:
             intent = self._intent_from_action_item(raw, source="level_theory")
             if intent is not None:
-                intent.priority += 0.25
+                intent.priority += 0.12
+                intent.information_gain = min(intent.information_gain, 0.55)
+                intent.goal_progress = min(intent.goal_progress, 0.2 if theory.evidence_level == 1 else intent.goal_progress)
                 intents.append(intent)
         return self._compile_intents_to_proposals(intents, scene, legal)
 
@@ -3869,11 +4917,20 @@ class MyAgent(_BaseAgent):
         state = scene.state_hash
         tried = level.tried_actions_by_state.setdefault(state, set())
         noops = level.noop_actions_by_state.get(state, set())
-        simple = [name for name in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5") if name in legal_names]
-        simple_probes = [] if level.mechanism.mode == "click_selection" else simple
+        simple = [
+            name for name in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5")
+            if name in legal_names and not self._action_family_disabled(name)
+        ]
+        if level.mechanism.mode == "click_selection":
+            simple_probes = []
+        elif level.mechanism.mode == "global_transform":
+            simple_probes = [name for name in ("ACTION3", "ACTION4", "ACTION5") if name in simple] or simple
+        else:
+            simple_probes = simple
         if not level.controlled_object_id or level.stage in {V1Phase.INIT, V1Phase.ACTION_GROUNDING}:
             for idx, name in enumerate(simple_probes):
-                if name not in tried and name not in noops:
+                if name not in tried and name not in noops and not self._primitive_grounding_complete(name):
+                    contextual = name == "ACTION5"
                     proposals.append(
                         ActionProposal(
                             source="action_grounding_probe",
@@ -3881,9 +4938,10 @@ class MyAgent(_BaseAgent):
                             purpose=f"ground {name}: identify controlled object/effect/resource cost",
                             phase=V1Phase.ACTION_GROUNDING,
                             expected_predicates=[{"type": "no_retry"}],
-                            information_gain=0.55 if name != "ACTION5" else 0.7,
-                            novelty=0.7,
-                            priority=0.2 - 0.02 * idx,
+                            information_gain=0.45 if contextual else 0.55,
+                            novelty=0.55 if contextual else 0.7,
+                            cost=1.25 if contextual else 1.0,
+                            priority=0.08 if contextual else 0.2 - 0.02 * idx,
                         )
                     )
         nav = None if level.mechanism.mode == "click_selection" else self._frontier_navigation_action(state, simple)
@@ -3903,7 +4961,7 @@ class MyAgent(_BaseAgent):
         semantic = self._semantic_nav_proposal(scene, legal)
         if semantic is not None:
             proposals.append(semantic)
-        if "ACTION6" in legal_names and self._action6_should_probe(scene):
+        if "ACTION6" in legal_names and self._action6_should_probe(scene) and self._action6_budget_available(legal):
             action6_count = 0
             for cand in self._action6_candidate_objects(scene):
                 cand_key = self._action6_key_from_xy(cand.x, cand.y)
@@ -3971,7 +5029,7 @@ class MyAgent(_BaseAgent):
                 )
             )
         legal_names = {action_name(action) for action in legal}
-        if "ACTION6" in legal_names and best_schema.confidence >= 0.5:
+        if "ACTION6" in legal_names and best_schema.confidence >= 0.5 and self._action6_budget_available(legal):
             for cand in self._action6_candidate_objects(scene)[:6]:
                 if self._action6_candidate_blocked(cand, scene):
                     continue
@@ -4073,12 +5131,21 @@ class MyAgent(_BaseAgent):
         elif name == "NAVIGATE":
             intent_type = IntentType.NAVIGATE_TO_OBJECT.value
         elif name == "ACTION6":
+            x = self._coerce_int(normalized.get("x"))
+            y = self._coerce_int(normalized.get("y"))
             if candidate_id:
                 intent_type = IntentType.CLICK_CANDIDATE.value
             elif target_id:
                 intent_type = IntentType.CLICK_OBJECT.value
-            else:
+            elif x is not None and y is not None:
                 intent_type = IntentType.CLICK_CANDIDATE.value
+            else:
+                self.memory.game.controller_stats.contract_repairs["bare_action6_no_target_candidate_coord"] += 1
+                self.logger.log_event(
+                    "vlm_contract_repair_failed",
+                    {"reason": "bare_action6_no_target_candidate_coord", "item": _json_safe(normalized)},
+                )
+                return None
         elif name in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION7", "RESET"}:
             intent_type = IntentType.PRIMITIVE_ACTION.value
         elif target_id and raw_intent in {"click", "click_object", "test", "test_object"}:
@@ -4113,29 +5180,86 @@ class MyAgent(_BaseAgent):
 
     def _vlm_result_to_intents(self, result: VLMResult, scene: SceneSnapshot) -> list[ActionIntent]:
         intents: list[ActionIntent] = []
+        if result.mode == VLMMode.REPAIR_DECISION.value:
+            self.logger.log_event("vlm_repair_free_actions_ignored", {"reason": "repair_decision_candidate_choice_only"})
+            return intents
 
         def add(raw: dict[str, Any], source: str) -> None:
             intent = self._intent_from_action_item(raw, source)
             if intent is not None:
                 intents.append(intent)
 
+        decision = result.decision if isinstance(result.decision, dict) else {}
+        decision_kind = _decision_kind(decision)
+        if decision_kind in _DECISION_SINGLE_KINDS:
+            for item in _decision_action_items(decision, limit=4):
+                add(item, "vlm_decision")
         for item in result.intent_proposals:
             add(item, "vlm_intent")
-        for item in result.recommended_experiments:
-            add(item, "vlm_experiment")
-        for item in result.plan_proposals:
-            add(item, "vlm_plan")
-        for item in result.plan[: self.config.plan_horizon]:
-            merged = {**item, "action": item.get("name") or item.get("action")}
-            if result.target_object_id and not merged.get("target_object_id"):
-                merged["target_object_id"] = result.target_object_id
-            add(merged, "vlm_plan")
-        if result.next_action:
-            merged = {**result.next_action, "action": result.next_action.get("name") or result.next_action.get("action")}
-            if result.target_object_id and not merged.get("target_object_id"):
-                merged["target_object_id"] = result.target_object_id
-            add(merged, "vlm_plan")
         return intents
+
+    def _navigation_preflight(
+        self,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        target_id: str,
+    ) -> tuple[bool, CompileStatus, str]:
+        if not target_id:
+            return False, CompileStatus.TARGET_MISSING, "missing target"
+        target = scene.object_by_id(target_id)
+        if target is None:
+            return False, CompileStatus.TARGET_NOT_VISIBLE, target_id
+        if self._target_blocked(target_id, scene):
+            return False, CompileStatus.TARGET_BLOCKED, target_id
+        actor = scene.object_by_id(self.memory.level.controlled_object_id)
+        if actor is None:
+            return False, CompileStatus.ACTOR_UNKNOWN, "controlled actor unknown"
+        vectors = self._grounded_action_vectors(legal)
+        if not vectors:
+            return False, CompileStatus.ACTION_VECTORS_UNKNOWN, "grounded vectors unknown"
+        floor_colors = self._walkable_colors(scene, actor)
+        if not floor_colors:
+            return False, CompileStatus.WALKABLE_UNKNOWN, "walkable colors unknown"
+        path = self._plan_path_to_object(scene, target_id, legal, use_weak_vectors=False)
+        if not path:
+            return False, CompileStatus.NO_PATH_KNOWN, "no grounded path"
+        return True, CompileStatus.OK, ""
+
+    def _grounding_proposals_for_nav_failure(
+        self,
+        status: CompileStatus,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+    ) -> list[ActionProposal]:
+        if status not in {
+            CompileStatus.ACTOR_UNKNOWN,
+            CompileStatus.ACTION_VECTORS_UNKNOWN,
+            CompileStatus.WALKABLE_UNKNOWN,
+            CompileStatus.NO_PATH_KNOWN,
+        }:
+            return []
+        legal_names = {action_name(action) for action in legal}
+        tried = self.memory.level.tried_actions_by_state.setdefault(scene.state_hash, set())
+        noops = self.memory.level.noop_actions_by_state.get(scene.state_hash, set())
+        proposals: list[ActionProposal] = []
+        for idx, name in enumerate(("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5")):
+            if name not in legal_names or name in tried or name in noops:
+                continue
+            proposals.append(
+                ActionProposal(
+                    source="nav_grounding_repair",
+                    action_name=name,
+                    purpose=f"ground controls before NAVIGATE after {status.value}",
+                    phase=V1Phase.ACTION_GROUNDING,
+                    expected_predicates=[{"type": "no_retry"}],
+                    information_gain=0.6,
+                    goal_progress=0.05,
+                    novelty=0.65,
+                    priority=0.35 - 0.02 * idx,
+                    raw={"nav_compile_status": status.value},
+                )
+            )
+        return proposals
 
     def _compile_intent(self, intent: ActionIntent, scene: SceneSnapshot, legal: Sequence[Any]) -> CompileResult:
         legal_names = {action_name(action) for action in legal}
@@ -4181,7 +5305,7 @@ class MyAgent(_BaseAgent):
         kind = str(intent.intent_type)
         name = _short_string(intent.action_name, 40).upper()
         if kind == IntentType.PRIMITIVE_ACTION.value:
-            if name in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"}:
+            if name in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION7", "RESET"}:
                 if not legal_allows(name):
                     return fail(CompileStatus.ILLEGAL_ACTION, f"{name} not legal")
                 return make(name)
@@ -4213,25 +5337,18 @@ class MyAgent(_BaseAgent):
 
         if kind == IntentType.NAVIGATE_TO_OBJECT.value:
             target_id = intent.target_object_id
-            if not target_id:
-                return fail(CompileStatus.TARGET_MISSING, "navigate target missing")
-            target = scene.object_by_id(target_id)
-            if target is None:
-                return fail(CompileStatus.TARGET_NOT_VISIBLE, target_id)
-            if self._target_blocked(target_id, scene):
-                return fail(CompileStatus.TARGET_BLOCKED, target_id, severity="soft")
-            actor = scene.object_by_id(self.memory.level.controlled_object_id)
-            if actor is None:
-                return fail(CompileStatus.ACTOR_UNKNOWN, "controlled actor unknown", severity="need_grounding")
-            vectors = self._grounded_action_vectors(legal)
-            if not vectors:
-                return fail(CompileStatus.ACTION_VECTORS_UNKNOWN, "no grounded movement vectors", severity="need_grounding")
-            floor_colors = self._walkable_colors(scene, actor)
-            if not floor_colors:
-                return fail(CompileStatus.WALKABLE_UNKNOWN, "walkable colors unknown", severity="need_grounding")
-            path = self._plan_path_to_object(scene, target_id, legal)
+            ok, status, detail = self._navigation_preflight(scene, legal, target_id)
+            if not ok:
+                severity = "need_grounding" if status in {
+                    CompileStatus.ACTOR_UNKNOWN,
+                    CompileStatus.ACTION_VECTORS_UNKNOWN,
+                    CompileStatus.WALKABLE_UNKNOWN,
+                    CompileStatus.NO_PATH_KNOWN,
+                } else "soft"
+                return fail(status, detail, severity=severity)
+            path = self._plan_path_to_object(scene, target_id, legal, use_weak_vectors=False)
             if not path:
-                return fail(CompileStatus.NO_PATH_KNOWN, "no path to target", severity="soft")
+                return fail(CompileStatus.NO_PATH_KNOWN, "no grounded path", severity="soft")
             first = path[0]
             if not legal_allows(first):
                 return fail(CompileStatus.ILLEGAL_ACTION, f"compiled {first} not legal")
@@ -4240,17 +5357,834 @@ class MyAgent(_BaseAgent):
         return fail(CompileStatus.UNSUPPORTED_INTENT, kind)
 
     def _compile_intents_to_proposals(
-        self, intents: list[ActionIntent], scene: SceneSnapshot, legal: Sequence[Any]
+        self,
+        intents: list[ActionIntent],
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        decision: dict[str, Any] | None = None,
+        owner: str = "intent_compiler",
     ) -> list[ActionProposal]:
         proposals: list[ActionProposal] = []
         for intent in intents:
             compiled = self._compile_intent(intent, scene, legal)
+            if decision is not None or not compiled.ok:
+                self._record_compile_result(decision, compiled, owner=owner or intent.source)
             if compiled.ok and compiled.proposal is not None:
                 proposals.append(compiled.proposal)
         return proposals
 
     def _vlm_result_to_proposals(self, result: VLMResult, scene: SceneSnapshot, legal: Sequence[Any] = ()) -> list[ActionProposal]:
         return self._compile_intents_to_proposals(self._vlm_result_to_intents(result, scene), scene, legal)
+
+    def _try_vlm_single_action(
+        self,
+        result: VLMResult,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        state: str,
+        decision: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any], str] | None:
+        if result.mode in {VLMMode.REPAIR_DECISION.value, "INVALID_PARTIAL"}:
+            return None
+        decision = result.decision if isinstance(result.decision, dict) else {}
+        if _decision_kind(decision) not in _DECISION_SINGLE_KINDS and not result.intent_proposals:
+            return None
+        intents = self._vlm_result_to_intents(result, scene)
+        if not intents:
+            return None
+        if decision is not None:
+            decision.setdefault("owner_attempts", []).append({"owner": "vlm_single", "intents": len(intents)})
+        proposals = self._compile_intents_to_proposals(intents, scene, legal, decision=decision, owner="vlm")
+        chosen = self._choose_best_proposal(proposals, scene, legal, state, decision=decision)
+        selected = self._instantiate_proposal(chosen, scene, legal) if chosen else None
+        if selected is None:
+            return None
+        action, proposal, source = selected
+        return action, {**proposal, "owner": "vlm"}, source
+
+    def _build_candidate_plan(
+        self,
+        raw_plan: dict[str, Any],
+        result: VLMResult | None,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+    ) -> ActivePlan | None:
+        steps_raw = raw_plan.get("steps")
+        if not isinstance(steps_raw, list) or not steps_raw:
+            return None
+        source = _short_string(raw_plan.get("source") or "candidate_plan", 80)
+        goal = _short_string(raw_plan.get("goal") or (result.plan_goal if result is not None else "") or source, 400)
+        default_target = _short_string(raw_plan.get("target_object_id") or (result.target_object_id if result is not None else ""), 24).upper()
+        steps: list[ActivePlanStep] = []
+        for idx, item in enumerate(steps_raw[: self.config.plan_horizon]):
+            if not isinstance(item, dict):
+                continue
+            raw_item = dict(item)
+            if default_target and not raw_item.get("target_object_id"):
+                raw_item["target_object_id"] = default_target
+            intent = self._intent_from_action_item(raw_item, source=source)
+            if intent is None:
+                self.logger.log_event("candidate_plan_step_rejected", {"source": source, "step": _json_safe(raw_item), "reason": "unsupported_intent"})
+                continue
+            step_seed = json.dumps({"source": source, "idx": idx, "intent": _json_safe(intent)}, sort_keys=True, default=str)
+            steps.append(
+                ActivePlanStep(
+                    step_id="APS:" + hashlib.sha1(step_seed.encode()).hexdigest()[:10],
+                    intent=intent,
+                    expected_predicates=list(intent.expected_predicates),
+                    preconditions=raw_item.get("preconditions") if isinstance(raw_item.get("preconditions"), list) else [],
+                    max_attempts=max(1, int(raw_item.get("max_attempts", 1) or 1)) if not isinstance(raw_item.get("max_attempts"), bool) else 1,
+                )
+            )
+        if not steps:
+            return None
+        plan_seed = json.dumps(
+            {"source": source, "goal": goal, "steps": [_json_safe(step.intent) for step in steps]},
+            sort_keys=True,
+            default=str,
+        )
+        return ActivePlan(
+            plan_id="AP:" + hashlib.sha1(plan_seed.encode()).hexdigest()[:12],
+            source=source,
+            goal=goal,
+            theory_id=_short_string(raw_plan.get("theory_id"), 80),
+            steps=steps,
+            confidence=_clamp01(raw_plan.get("confidence", 0.4)),
+            evidence_level=int(raw_plan.get("evidence_level", 0) or 0),
+        )
+
+    def _preflight_candidate_plan(self, plan: ActivePlan, scene: SceneSnapshot, legal: Sequence[Any]) -> bool:
+        step = plan.current_step()
+        if step is None:
+            return False
+        compiled = self._compile_intent(step.intent, scene, legal)
+        if not compiled.ok:
+            self.logger.log_event(
+                "candidate_plan_preflight_failed",
+                {"plan_id": plan.plan_id, "status": compiled.status.value, "detail": compiled.detail[:240]},
+            )
+            return False
+        if compiled.proposal is not None and self._action_family_disabled(compiled.proposal.action_name):
+            self.logger.log_event(
+                "candidate_plan_preflight_failed",
+                {"plan_id": plan.plan_id, "status": "ACTION_FAMILY_DISABLED", "detail": compiled.proposal.action_name},
+            )
+            return False
+        return True
+
+    def _accept_vlm_candidate_plans(
+        self,
+        result: VLMResult,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        decision: dict[str, Any] | None = None,
+    ) -> None:
+        decision_payload = result.decision if isinstance(result.decision, dict) else {}
+        if _decision_kind(decision_payload) not in _DECISION_PLAN_KINDS:
+            return
+        decision_steps = _decision_plan_items(decision_payload)
+        if not decision_steps:
+            return
+        if not self._vlm_plan_steps_pass_quality(decision_steps, scene, result.target_object_id):
+            return
+        raw = {
+            "source": "vlm_decision_plan",
+            "goal": _short_string(decision_payload.get("goal") or result.plan_goal or "vlm_decision_plan", 320),
+            "target_object_id": result.target_object_id,
+            "steps": decision_steps,
+            "confidence": _clamp01(decision_payload.get("confidence", 0.45)),
+            "evidence_level": int(decision_payload.get("evidence_level", 1) or 1),
+        }
+        plan = self._build_candidate_plan(raw, result, scene, legal)
+        if plan is None:
+            return
+        if not self._preflight_candidate_plan(plan, scene, legal):
+            if decision is not None:
+                decision.setdefault("candidates", []).append({"owner": "vlm", "candidate_plan_rejected": plan.as_prompt()})
+            return
+        if any(existing.plan_id == plan.plan_id for existing in self.memory.level.candidate_plans):
+            return
+        self.memory.level.candidate_plans.append(plan)
+        if decision is not None:
+            decision.setdefault("candidates", []).append({"owner": "vlm", "candidate_plan": plan.as_prompt()})
+        self.logger.log_event("candidate_plan_created", plan.as_prompt())
+
+    def _maybe_activate_candidate_plan(self, scene: SceneSnapshot, legal: Sequence[Any], decision: dict[str, Any] | None = None) -> bool:
+        level = self.memory.level
+        if level.active_plan is not None:
+            return False
+        candidates = sorted(
+            list(level.candidate_plans),
+            key=lambda p: (p.evidence_level, p.confidence, -p.failures),
+            reverse=True,
+        )
+        for plan in candidates:
+            if plan.status in {"failed", "completed"}:
+                continue
+            if not self._preflight_candidate_plan(plan, scene, legal):
+                continue
+            plan.status = "active"
+            level.active_plan = plan
+            if decision is not None:
+                decision.setdefault("owner_attempts", []).append({"owner": "active_plan", "activated": plan.plan_id})
+            self.logger.log_event("active_plan_started", plan.as_prompt())
+            return True
+        return False
+
+    def _fail_active_plan(self, reason: str) -> None:
+        level = self.memory.level
+        plan = level.active_plan
+        if plan is not None:
+            plan.status = "failed"
+            plan.failures += 1
+            self.logger.log_event("active_plan_failed", {**plan.as_prompt(), "reason": reason[:240]})
+        level.active_plan = None
+        self._enter_repair_mode(reason)
+
+    def _try_active_plan_action(
+        self,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        state: str,
+        decision: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any], str] | None:
+        plan = self.memory.level.active_plan
+        if plan is None or plan.status not in {"active", "candidate"}:
+            return None
+        plan.status = "active"
+        step = plan.current_step()
+        if step is None:
+            plan.status = "completed"
+            self.memory.level.active_plan = None
+            self.logger.log_event("active_plan_completed", plan.as_prompt())
+            return None
+        if decision is not None:
+            decision.setdefault("owner_attempts", []).append({"owner": "active_plan", "plan_id": plan.plan_id, "step_id": step.step_id})
+        compiled = self._compile_intent(step.intent, scene, legal)
+        self._record_compile_result(decision, compiled, owner="active_plan")
+        if not compiled.ok or compiled.proposal is None:
+            step.attempts += 1
+            step.last_failure = compiled.status.value
+            step.status = "failed" if step.attempts >= step.max_attempts else step.status
+            self._fail_active_plan(f"active_plan_compile_failed:{compiled.status.value}")
+            return None
+        if self._action_family_disabled(compiled.proposal.action_name):
+            step.attempts += 1
+            step.last_failure = f"action_family_disabled:{compiled.proposal.action_name}"
+            step.status = "failed"
+            self._fail_active_plan(step.last_failure)
+            self._enter_repair_mode(f"active_plan_{step.last_failure}")
+            return None
+        compiled.proposal.raw["_from_active_plan"] = True
+        compiled.proposal.raw["active_plan_id"] = plan.plan_id
+        compiled.proposal.raw["active_plan_step_id"] = step.step_id
+        selected = self._instantiate_proposal(compiled.proposal, scene, legal)
+        if selected is None:
+            step.attempts += 1
+            step.last_failure = "instantiate_failed"
+            self._fail_active_plan("active_plan_instantiate_failed")
+            return None
+        step.status = "running"
+        action, proposal, _source = selected
+        proposal = {
+            **proposal,
+            "owner": "active_plan",
+            "active_plan_id": plan.plan_id,
+            "active_plan_step_id": step.step_id,
+        }
+        return action, proposal, "active_plan"
+
+    def _update_active_plan_after_transition(self, pending: PendingAction, report: TransitionReport, event: EventRecord) -> None:
+        plan = self.memory.level.active_plan
+        if plan is None or plan.status != "active":
+            return
+        step = plan.current_step()
+        if step is None:
+            return
+        predicate_check = self._check_expected_predicates(step.expected_predicates or pending.expected_predicates, report)
+        if predicate_check.get("failed_count", 0) > 0 or report.retry_detected:
+            step.status = "failed"
+            step.last_failure = "checkpoint_failed_or_retry"
+            plan.failures += 1
+            self._invalidate_or_downgrade_active_theory("active_plan_checkpoint_failed", event.event_id)
+            self._fail_active_plan("checkpoint_failed_or_retry")
+            return
+        if report.effective_noop and pending.name in {"ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5", "ACTION6"}:
+            step.status = "failed"
+            step.last_failure = "noop"
+            plan.failures += 1
+            self._invalidate_or_downgrade_active_theory("active_plan_noop", event.event_id)
+            self._fail_active_plan("noop")
+            return
+        step.status = "done"
+        plan.cursor += 1
+        self.logger.log_event("active_plan_step_done", {"plan_id": plan.plan_id, "step_id": step.step_id, "cursor": plan.cursor})
+        if plan.current_step() is None:
+            plan.status = "completed"
+            self.memory.level.active_plan = None
+            self.logger.log_event("active_plan_completed", plan.as_prompt())
+
+    def _repair_candidate_id(self, proposal: ActionProposal) -> str:
+        seed = json.dumps(
+            {
+                "source": proposal.source,
+                "action": proposal.action_key(),
+                "target": proposal.target_object_id,
+                "purpose": proposal.purpose[:120],
+                "candidate_kind": proposal.raw.get("candidate_kind", ""),
+            },
+            sort_keys=True,
+            default=str,
+        )
+        return "RP_" + hashlib.sha1(seed.encode()).hexdigest()[:10].upper()
+
+    def _vlm_repair_target_hints(self) -> set[str]:
+        choice = self.memory.level.vlm_repair_choice if isinstance(self.memory.level.vlm_repair_choice, dict) else {}
+        hints: set[str] = set()
+        target = _short_string(choice.get("target_object_id"), 24).upper()
+        if target:
+            hints.add(target)
+        raw_hints = choice.get("target_hints")
+        if isinstance(raw_hints, list):
+            for item in raw_hints:
+                text = _short_string(item, 24).upper()
+                if text:
+                    hints.add(text)
+        return hints
+
+    def _action6_frontier_proposals(
+        self,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        reason: str,
+    ) -> list[ActionProposal]:
+        legal_names = {action_name(action) for action in legal}
+        if "ACTION6" not in legal_names:
+            return []
+        level = self.memory.level
+        only_action6 = self._action6_is_only_forward_action(legal)
+        allow_family_disabled = False
+        if self._action_family_disabled("ACTION6"):
+            return []
+        target_hints = self._vlm_repair_target_hints()
+        attempts = level.action_attempt_counts_by_state.get(scene.state_hash, {})
+        noops = level.noop_actions_by_state.get(scene.state_hash, set())
+        candidates = self._action6_candidate_objects(scene)
+
+        def history(candidate: Action6Candidate) -> dict[str, Any]:
+            sig = self._action6_signature(scene, candidate.x, candidate.y, candidate.target_object_id, candidate.candidate_kind)
+            seen_exact = False
+            seen_local = False
+            effects = 0
+            failures = 0
+            for rec in level.action6_memory.records[-160:]:
+                exact = rec.state_hash == sig.state_hash and rec.x == sig.x and rec.y == sig.y
+                local = (
+                    rec.local_patch_signature == sig.local_patch_signature
+                    and rec.target_type_key == sig.object_type_key
+                    and rec.candidate_kind == sig.candidate_kind
+                )
+                if not (exact or local):
+                    continue
+                seen_exact = seen_exact or exact
+                seen_local = seen_local or local
+                if rec.outcome in {"noop", "nonprogress"}:
+                    failures += 1
+                else:
+                    effects += 1
+            return {"seen_exact": seen_exact, "seen_local": seen_local, "effects": effects, "failures": failures}
+
+        ranked: list[tuple[tuple[int, int, int, int, int, float, float], Action6Candidate, dict[str, Any]]] = []
+        suppressed = 0
+        for candidate in candidates:
+            key = self._action6_key_from_xy(candidate.x, candidate.y)
+            blocked = self._action6_candidate_blocked(candidate, scene)
+            hist = history(candidate)
+            hinted = bool(candidate.target_object_id and candidate.target_object_id in target_hints)
+            seen = bool(hist["seen_exact"] or hist["seen_local"] or key in noops)
+            rank = (
+                1 if seen else 0,
+                -int(hist["effects"]),
+                0 if hinted else 1,
+                int(hist["failures"]),
+                int(attempts.get(key, 0)),
+                -float(candidate.prior_score),
+                -float(candidate.salience),
+            )
+            if blocked or key in noops:
+                suppressed += 1
+                continue
+            ranked.append((rank, candidate, hist))
+        if not ranked and suppressed:
+            self.logger.log_event(
+                "action6_frontier_exhausted",
+                {"reason": reason, "suppressed": suppressed, "only_action6": only_action6, "state": scene.state_hash[:12]},
+            )
+        ranked.sort(key=lambda item: item[0])
+
+        proposals: list[ActionProposal] = []
+        for idx, (_rank, candidate, hist) in enumerate(ranked[:8]):
+            hinted = bool(candidate.target_object_id and candidate.target_object_id in target_hints)
+            proposals.append(
+                ActionProposal(
+                    source="action6_frontier",
+                    action_name="ACTION6",
+                    x=candidate.x,
+                    y=candidate.y,
+                    target_object_id=candidate.target_object_id,
+                    purpose=f"ACTION6 candidate frontier search after {reason}",
+                    phase=V1Phase.RECOVER if level.recovery_mode else V1Phase.MECHANIC_EXPLORATION,
+                    expected_predicates=[
+                        {"type": "no_retry"},
+                        {"type": "summary", "summary": "test untried or historically effective ACTION6 signature"},
+                        {"type": "candidate_kind", "candidate_kind": candidate.candidate_kind},
+                    ],
+                    information_gain=0.62 if not hist["seen_exact"] and not hist["seen_local"] else 0.36,
+                    goal_progress=0.18 + min(0.24, 0.08 * int(hist["effects"])),
+                    novelty=0.75 if not hist["seen_exact"] and not hist["seen_local"] else 0.3,
+                    priority=0.35 + (0.18 if hinted else 0.0) + min(0.2, 0.07 * int(hist["effects"])) - 0.08 * idx,
+                    raw={
+                        "candidate_id": candidate.candidate_id,
+                        "candidate_kind": candidate.candidate_kind,
+                        "local_patch_signature": candidate.local_patch_signature,
+                        "frontier_history": hist,
+                        "vlm_target_hint": hinted,
+                        "only_action6_frontier": only_action6,
+                        "family_disabled_bypass": allow_family_disabled,
+                        "relaxed_frontier": False,
+                    },
+                )
+            )
+        return proposals
+
+    def _repair_policy_proposals(self, scene: SceneSnapshot, legal: Sequence[Any]) -> list[ActionProposal]:
+        level = self.memory.level
+        reason = level.recovery_reason or level.recovery_mode or "repair"
+        if self._action6_is_only_forward_action(legal):
+            return self._action6_frontier_proposals(scene, legal, reason)
+        proposals: list[ActionProposal] = []
+        if level.recovery_mode == "escape_from_action6_loop":
+            self._disable_action_family("ACTION6", 1, "active action6 recovery")
+            proposals.extend(self._anti_loop_escape_proposals(scene, legal, reason))
+        elif level.recovery_mode == "repair_nonprogress_loop":
+            proposals.extend(self._anti_loop_escape_proposals(scene, legal, reason))
+            proposals.extend(self._level_theory_proposals(scene, legal))
+            proposals.extend(self._experiment_scheduler_proposals(scene, legal))
+        elif level.recovery_mode == "repair_compile_failure":
+            last = level.last_compile_failures[-1] if level.last_compile_failures else {}
+            status = CompileStatus(str(last.get("status", CompileStatus.UNSUPPORTED_INTENT.value))) if last.get("status") in {item.value for item in CompileStatus} else CompileStatus.UNSUPPORTED_INTENT
+            proposals.extend(self._grounding_proposals_for_nav_failure(status, scene, legal))
+            proposals.extend(self._anti_loop_escape_proposals(scene, legal, reason or status.value))
+        elif level.recovery_mode == "recover_after_retry":
+            proposals.extend(self._anti_loop_escape_proposals(scene, legal, reason or "retry"))
+            proposals.extend(self._experiment_scheduler_proposals(scene, legal))
+        elif level.recovery_mode:
+            proposals.extend(self._anti_loop_escape_proposals(scene, legal, reason or "proposal_recovery"))
+            proposals.extend(self._experiment_scheduler_proposals(scene, legal))
+        return proposals
+
+    def _cache_repair_action_candidates(
+        self,
+        proposals: list[ActionProposal],
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        decision: dict[str, Any] | None = None,
+    ) -> None:
+        payloads: list[dict[str, Any]] = []
+        for proposal in proposals[:12]:
+            repair_id = self._repair_candidate_id(proposal)
+            proposal.raw["repair_candidate_id"] = repair_id
+            payload = {
+                "repair_candidate_id": repair_id,
+                "source": proposal.source,
+                "action": proposal.action_key(),
+                "target_object_id": proposal.target_object_id,
+                "purpose": proposal.purpose[:240],
+                "expected_predicates": proposal.expected_predicates[:6],
+                "priority": round(float(proposal.priority), 4),
+                "information_gain": round(float(proposal.information_gain), 4),
+                "goal_progress": round(float(proposal.goal_progress), 4),
+                "raw": _json_safe(proposal.raw),
+            }
+            payloads.append(payload)
+        self.memory.level.repair_action_candidates = payloads
+        if decision is not None and payloads:
+            decision.setdefault("candidates", []).append({"owner": "repair_policy", "repair_candidates": payloads[:8]})
+
+    def _apply_vlm_repair_choice(self, result: VLMResult) -> None:
+        decision = result.decision if isinstance(result.decision, dict) else {}
+        if _short_string(decision.get("kind"), 80) != "repair_decision":
+            return
+        level = self.memory.level
+        selected_id = _short_string(
+            decision.get("selected_repair_candidate_id")
+            or decision.get("repair_candidate_id")
+            or decision.get("candidate_id"),
+            40,
+        ).upper()
+        target_hints: list[str] = []
+        for raw in decision.get("intents", []) if isinstance(decision.get("intents"), list) else []:
+            if not isinstance(raw, dict):
+                continue
+            target = _short_string(raw.get("target_object_id") or raw.get("target") or raw.get("object_id"), 24).upper()
+            if target and target not in target_hints:
+                target_hints.append(target)
+        explicit_target = _short_string(decision.get("target_object_id"), 24).upper()
+        if explicit_target and explicit_target not in target_hints:
+            target_hints.append(explicit_target)
+        known = {
+            _short_string(item.get("repair_candidate_id"), 40).upper(): item
+            for item in level.repair_action_candidates
+            if isinstance(item, dict)
+        }
+        choice: dict[str, Any] = {
+            "step": self._controller_step(),
+            "reason": level.recovery_reason,
+            "target_hints": target_hints,
+            "rationale": _short_string(decision.get("rationale") or decision.get("goal"), 240),
+        }
+        if selected_id and selected_id in known:
+            choice.update(known[selected_id])
+            choice["repair_candidate_id"] = selected_id
+            level.vlm_repair_choice = choice
+            self.logger.log_event("vlm_repair_candidate_selected", {"repair_candidate_id": selected_id, "target_hints": target_hints})
+        else:
+            if target_hints:
+                level.vlm_repair_choice = choice
+            if selected_id:
+                self.logger.log_event("vlm_repair_candidate_ignored", {"repair_candidate_id": selected_id, "known": sorted(known)[:12]})
+        if decision.get("intents"):
+            self.logger.log_event("vlm_repair_free_actions_ignored", {"target_hints": target_hints, "reason": "candidate_choice_only"})
+
+    def _bias_repair_proposals_from_vlm_choice(self, proposals: list[ActionProposal]) -> None:
+        choice = self.memory.level.vlm_repair_choice if isinstance(self.memory.level.vlm_repair_choice, dict) else {}
+        selected_id = _short_string(choice.get("repair_candidate_id"), 40).upper()
+        if not selected_id:
+            return
+        for proposal in proposals:
+            if _short_string(proposal.raw.get("repair_candidate_id"), 40).upper() == selected_id:
+                proposal.priority += 0.9
+                proposal.raw["vlm_repair_selected"] = True
+                break
+
+    def _maybe_request_repair_vlm_update(
+        self,
+        scene: SceneSnapshot,
+        transition: TransitionReport | None,
+        legal: Sequence[Any],
+        decision: dict[str, Any] | None = None,
+        *,
+        state: str = "NOT_FINISHED",
+    ) -> VLMResult | None:
+        level = self.memory.level
+        if not level.recovery_mode:
+            return None
+        if level.recovery_until_step and self._controller_step() > level.recovery_until_step:
+            return None
+        if (
+            level.last_repair_vlm_reason == level.recovery_reason
+            and self._controller_step() - level.last_repair_vlm_step < 6
+        ):
+            return None
+        proposals = self._repair_policy_proposals(scene, legal)
+        self._cache_repair_action_candidates(proposals, scene, legal, decision)
+        mode = self._choose_vlm_mode(scene, transition, legal)
+        if mode != VLMMode.REPAIR_DECISION:
+            return None
+        level.last_repair_vlm_reason = level.recovery_reason
+        level.last_repair_vlm_step = self._controller_step()
+        if decision is not None:
+            decision["vlm_mode"] = mode.value
+            decision.setdefault("owner_attempts", []).append(
+                {"owner": "vlm_repair_analysis", "mode": mode.value, "reason": level.recovery_reason}
+            )
+        result = self._request_vlm_once(scene, transition, legal, mode)
+        if result is not None:
+            self._apply_vlm_update(result, transition, scene, legal)
+            self._apply_vlm_repair_choice(result)
+        return result
+
+    def _try_repair_action(
+        self,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        state: str,
+        decision: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any], str] | None:
+        level = self.memory.level
+        if not level.recovery_mode:
+            return None
+        if level.recovery_until_step and self._controller_step() > level.recovery_until_step:
+            self.logger.log_event(
+                "repair_mode_expired",
+                {"mode": level.recovery_mode, "reason": level.recovery_reason, "until": level.recovery_until_step},
+            )
+            level.recovery_mode = ""
+            level.recovery_reason = ""
+            level.recovery_until_step = 0
+            level.repair_action_candidates = []
+            if level.force_vlm_reason == "repair_decision":
+                level.force_vlm_reason = ""
+            return None
+        if decision is not None:
+            decision.setdefault("owner_attempts", []).append({"owner": "repair", "mode": level.recovery_mode, "reason": level.recovery_reason})
+        proposals = self._repair_policy_proposals(scene, legal)
+        self._cache_repair_action_candidates(proposals, scene, legal, decision)
+        self._bias_repair_proposals_from_vlm_choice(proposals)
+        chosen = self._choose_best_proposal(proposals, scene, legal, state, decision=decision)
+        selected = self._instantiate_proposal(chosen, scene, legal) if chosen else None
+        if selected is None:
+            return None
+        action, proposal, source = selected
+        return action, {**proposal, "owner": "repair", "repair_mode": level.recovery_mode}, source
+
+    def _try_exploration_action(
+        self,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        state: str,
+        decision: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any], str] | None:
+        if self._maybe_activate_candidate_plan(scene, legal, decision):
+            selected = self._try_active_plan_action(scene, legal, state, decision)
+            if selected is not None:
+                return selected
+        if decision is not None:
+            decision.setdefault("owner_attempts", []).append({"owner": "exploration"})
+        proposals: list[ActionProposal] = []
+        proposals.extend(self._transfer_bootstrap_proposals(scene, legal))
+        need_grounding = not self.memory.level.controlled_object_id or not self._grounded_action_vectors(legal)
+        scheduled = self._experiment_scheduler_proposals(scene, legal)
+        if need_grounding:
+            grounding = [proposal for proposal in scheduled if proposal.source == "action_grounding_probe"]
+            chosen = self._choose_best_proposal(grounding, scene, legal, state, decision=decision)
+            selected = self._instantiate_proposal(chosen, scene, legal) if chosen else None
+            if selected is not None:
+                action, proposal, source = selected
+                return action, {**proposal, "owner": "exploration"}, source
+        proposals.extend(self._level_theory_proposals(scene, legal))
+        proposals.extend(scheduled)
+        chosen = self._choose_best_proposal(proposals, scene, legal, state, decision=decision)
+        selected = self._instantiate_proposal(chosen, scene, legal) if chosen else None
+        if selected is None:
+            return None
+        action, proposal, source = selected
+        return action, {**proposal, "owner": "exploration"}, source
+
+    def _note_fallback_selection(self, source: str, key: str, scene: SceneSnapshot) -> None:
+        fallback_sources = {"least_repeated_safe", "last_resort_non_reset"}
+        self.memory.level.fallback_action_records.append(
+            {
+                "step": self._controller_step(),
+                "source": _short_string(source, 80),
+                "action": _short_string(key, 80),
+                "state": scene.state_hash[:12],
+                "before": scene.state_hash[:12],
+                "after": "",
+                "pending": True,
+                "is_fallback": source in fallback_sources,
+                "frontier": False,
+                "effectful": False,
+                "state_novel": False,
+            }
+        )
+
+    def _update_fallback_transition_record(
+        self,
+        pending: PendingAction,
+        report: TransitionReport,
+        current_scene: SceneSnapshot,
+        effect_flags: dict[str, Any],
+    ) -> None:
+        key = pending.action_key()
+        level = self.memory.level
+        matched: dict[str, Any] | None = None
+        for item in reversed(level.fallback_action_records):
+            if not item.get("pending"):
+                continue
+            if item.get("action") != key:
+                continue
+            if item.get("before") != pending.scene_before.state_hash[:12]:
+                continue
+            matched = item
+            break
+        if matched is None:
+            return
+        matched.update(
+            {
+                "after": current_scene.state_hash[:12],
+                "pending": False,
+                "effective_noop": bool(report.effective_noop),
+                "changed_cells": report.changed_cell_count,
+                "world_changed_cells": report.world_changed_cell_count,
+                "state_changed": bool(effect_flags.get("state_changed")),
+                "state_novel": bool(effect_flags.get("state_novel")),
+                "new_object_frontier": bool(effect_flags.get("new_object_frontier")),
+                "effectful": bool(effect_flags.get("effectful")),
+                "frontier": bool(effect_flags.get("frontier")),
+                "summary": report.summary[:240],
+            }
+        )
+        if matched.get("is_fallback"):
+            self.logger.log_event(
+                "fallback_effect_recorded",
+                {
+                    "source": matched.get("source"),
+                    "action": key,
+                    "before": matched.get("before"),
+                    "after": matched.get("after"),
+                    "frontier": matched.get("frontier"),
+                    "effectful": matched.get("effectful"),
+                    "state_novel": matched.get("state_novel"),
+                },
+            )
+
+    def _fallback_record_has_frontier(self, item: dict[str, Any]) -> bool:
+        if item.get("pending"):
+            return False
+        return bool(item.get("state_novel") or item.get("new_object_frontier"))
+
+    def _fallback_overuse_detected(self) -> bool:
+        level = self.memory.level
+        if self._controller_step() < 8:
+            return False
+        if self._controller_step() - level.fallback_overuse_repair_step < 5:
+            return False
+        recent = list(level.fallback_action_records)[-10:]
+        if len(recent) < 6:
+            return False
+        fallback_recent = [item for item in recent if item.get("is_fallback")]
+        fallback_count = len(fallback_recent)
+        consecutive = 0
+        for item in reversed(recent):
+            if not item.get("is_fallback"):
+                break
+            consecutive += 1
+        repeated_sources = {item.get("source") for item in recent[-6:] if item.get("is_fallback")}
+        source_pressure = consecutive >= 4 or fallback_count >= 7 or (fallback_count >= 6 and len(repeated_sources) <= 2)
+        if not source_pressure:
+            return False
+
+        frontier_count = sum(1 for item in fallback_recent if self._fallback_record_has_frontier(item))
+        stale_count = fallback_count - frontier_count
+        stale_consecutive = 0
+        for item in reversed(recent):
+            if not item.get("is_fallback"):
+                break
+            if self._fallback_record_has_frontier(item):
+                break
+            stale_consecutive += 1
+        if frontier_count >= 2 and frontier_count >= max(2, fallback_count // 3):
+            self.logger.log_event(
+                "fallback_overuse_guard_skipped",
+                {
+                    "reason": "fallback_has_meaningful_frontier",
+                    "fallback_count": fallback_count,
+                    "frontier_count": frontier_count,
+                    "stale_count": stale_count,
+                    "consecutive": consecutive,
+                },
+            )
+            return False
+        return stale_consecutive >= 4 or stale_count >= max(5, fallback_count - 1)
+
+    def _record_anti_loop_escape_outcome(
+        self,
+        pending: PendingAction,
+        report: TransitionReport,
+        current_scene: SceneSnapshot,
+        effect_flags: dict[str, Any],
+        event: EventRecord,
+    ) -> None:
+        level = self.memory.level
+        if level.recovery_mode != "escape_from_action6_loop":
+            return
+        if pending.source != "anti_loop_escape" or pending.name not in {"ACTION1", "ACTION2"}:
+            return
+        progress = bool(
+            effect_flags.get("frontier")
+            or (
+                effect_flags.get("effectful")
+                and (
+                    effect_flags.get("movement")
+                    or effect_flags.get("resource_delta")
+                    or report.world_changed_cell_count > 12
+                )
+            )
+        )
+        if progress:
+            level.anti_loop_escape_failures = 0
+            return
+        level.anti_loop_escape_failures += 1
+        level.last_anti_loop_escape_failure_step = self._controller_step()
+        self._disable_action_family(pending.name, 3, "anti_loop_escape_no_progress")
+        self.logger.log_event(
+            "anti_loop_escape_no_progress",
+            {
+                "action": pending.name,
+                "event_id": event.event_id,
+                "failures": level.anti_loop_escape_failures,
+                "summary": report.summary[:240],
+            },
+        )
+        if level.anti_loop_escape_failures >= 2:
+            level.recovery_until_step = min(level.recovery_until_step or self._controller_step(), self._controller_step())
+            level.recovery_mode = ""
+            level.recovery_reason = ""
+            if level.force_vlm_reason == "repair_decision":
+                level.force_vlm_reason = ""
+            self.logger.log_event(
+                "anti_loop_escape_budget_exhausted",
+                {"event_id": event.event_id, "failures": level.anti_loop_escape_failures},
+            )
+
+    def _last_safe_recovery_action(
+        self,
+        scene: SceneSnapshot,
+        legal: Sequence[Any],
+        state: str,
+        decision: dict[str, Any] | None = None,
+    ) -> tuple[Any, dict[str, Any], str] | None:
+        if self._action6_is_only_forward_action(legal):
+            proposals = self._action6_frontier_proposals(scene, legal, "only_action6_fallback")
+            self._cache_repair_action_candidates(proposals, scene, legal, decision)
+            self._bias_repair_proposals_from_vlm_choice(proposals)
+            chosen = self._choose_best_proposal(proposals, scene, legal, state, decision=decision)
+            selected = self._instantiate_proposal(chosen, scene, legal) if chosen else None
+            if selected is not None:
+                action, proposal, source = selected
+                return action, {**proposal, "owner": "action6_frontier"}, source
+            action = self._last_resort_non_reset_legal_action(scene, legal)
+            if action is not None:
+                proposal = getattr(action, "reasoning", {})
+                return action, {**(proposal if isinstance(proposal, dict) else {}), "owner": "fallback"}, "last_resort_non_reset"
+            return None
+        if self.memory.level.recovery_mode:
+            selected = self._try_repair_action(scene, legal, state, decision)
+            if selected is not None:
+                return selected
+        if self._fallback_overuse_detected():
+            self.memory.level.fallback_overuse_repair_step = self._controller_step()
+            self._enter_repair_mode("fallback_overuse_loop")
+            if decision is not None:
+                decision.setdefault("owner_attempts", []).append(
+                    {"owner": "fallback_guard", "reason": "fallback_overuse_loop"}
+                )
+            selected = self._try_repair_action(scene, legal, state, decision)
+            if selected is not None:
+                return selected
+            return None
+        action = self._least_repeated_safe_legal_action(scene, legal)
+        if action is not None:
+            proposal = getattr(action, "reasoning", {})
+            return action, {**(proposal if isinstance(proposal, dict) else {}), "owner": "fallback"}, "least_repeated_safe"
+        action = self._last_resort_non_reset_legal_action(scene, legal)
+        if action is not None:
+            proposal = getattr(action, "reasoning", {})
+            return action, {**(proposal if isinstance(proposal, dict) else {}), "owner": "fallback"}, "last_resort_non_reset"
+        if state in {"NOT_PLAYED", "GAME_OVER", "WIN"}:
+            return self._reset_action(), {"name": "RESET", "owner": "terminal_reset"}, "reset"
+        return None
 
     def _anti_loop_escape_proposals(self, scene: SceneSnapshot, legal: Sequence[Any], reason: str) -> list[ActionProposal]:
         level = self.memory.level
@@ -4260,6 +6194,10 @@ class MyAgent(_BaseAgent):
         attempts = level.action_attempt_counts_by_state.get(state, {})
         proposals: list[ActionProposal] = []
         for name in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"):
+            if level.recovery_mode == "escape_from_action6_loop" and level.anti_loop_escape_failures >= 2 and name in {"ACTION1", "ACTION2"}:
+                continue
+            if self._action_family_disabled(name):
+                continue
             if name in legal_names and name not in noops and attempts.get(name, 0) == 0:
                 proposals.append(
                     ActionProposal(
@@ -4273,7 +6211,7 @@ class MyAgent(_BaseAgent):
                         priority=0.45,
                     )
                 )
-        if "ACTION6" in legal_names:
+        if "ACTION6" in legal_names and level.recovery_mode != "escape_from_action6_loop" and self._action6_budget_available(legal):
             cand = self._select_action6_candidate(scene, avoid_keys=set(level.recent_action_keys))
             if cand is not None:
                 proposals.append(
@@ -4302,7 +6240,7 @@ class MyAgent(_BaseAgent):
         recent = list(self.memory.level.recent_action_keys)
         candidates: list[tuple[tuple[int, int, int], str, Any]] = []
         for name in ("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5"):
-            if name not in legal_by_name:
+            if name not in legal_by_name or self._action_family_disabled(name):
                 continue
             key = name
             if key in noops or (state, key) in self.memory.level.blocked_state_action_pairs:
@@ -4319,28 +6257,9 @@ class MyAgent(_BaseAgent):
                 action,
                 {"name": key, "purpose": "least repeated recovery action", "expected_change": "escape rejected proposal state"},
             )
-        if "ACTION6" in legal_by_name:
+        if "ACTION6" in legal_by_name and self._action6_budget_available(legal):
             cand = self._select_action6_candidate(scene)
-            relaxed = False
-            if cand is None:
-                cand = self._select_action6_candidate(
-                    scene,
-                    avoid_keys=set(recent[-8:]) | set(self.memory.level.fallback_recent_keys),
-                    allow_blocked=True,
-                )
-                relaxed = cand is not None
             if cand is not None:
-                key = self._action6_key_from_xy(cand.x, cand.y)
-                if relaxed:
-                    self.logger.log_event(
-                        "recovery_relaxed_action6_selected",
-                        {
-                            "action": key,
-                            "state": scene.state_hash[:12],
-                            "attempts": attempts.get(key, 0),
-                            "candidate_id": cand.candidate_id,
-                        },
-                    )
                 return self._make_action6(
                     legal_by_name["ACTION6"],
                     cand.x,
@@ -4352,11 +6271,8 @@ class MyAgent(_BaseAgent):
                         "target_object_id": cand.target_object_id,
                         "purpose": "least repeated recovery click",
                         "expected_change": "escape rejected proposal state",
-                        "expected_predicates": [
-                            {"type": "no_retry"},
-                            {"type": "summary", "summary": "relaxed recovery click when all strict candidates were exhausted"},
-                        ] if relaxed else [{"type": "not_noop"}],
-                        "relaxed_recovery": relaxed,
+                        "expected_predicates": [{"type": "not_noop"}],
+                        "relaxed_recovery": False,
                     },
                 )
         return None
@@ -4365,10 +6281,16 @@ class MyAgent(_BaseAgent):
         legal_by_name = {action_name(action): action for action in legal}
         state = scene.state_hash
         attempts = self.memory.level.action_attempt_counts_by_state.get(state, {})
+        noops = self.memory.level.noop_actions_by_state.get(state, set())
         recent = list(self.memory.level.recent_action_keys)
         primitive_choices: list[tuple[tuple[int, int, int, int], str, Any]] = []
         for index, name in enumerate(("ACTION1", "ACTION2", "ACTION3", "ACTION4", "ACTION5")):
-            if name not in legal_by_name:
+            if name not in legal_by_name or self._action_family_disabled(name):
+                continue
+            if name in noops or (state, name) in self.memory.level.blocked_state_action_pairs:
+                continue
+            hard_loop, _soft = self._loop_guard_decision(name, scene)
+            if hard_loop or self.memory.game.failure_model.forbids(list(recent), name):
                 continue
             score = (recent[-6:].count(name), attempts.get(name, 0), recent.count(name), index)
             primitive_choices.append((score, name, legal_by_name[name]))
@@ -4384,31 +6306,40 @@ class MyAgent(_BaseAgent):
                     "expected_predicates": [{"type": "no_retry"}],
                 },
             )
-        if "ACTION6" in legal_by_name:
-            cand = self._select_action6_candidate(
-                scene,
-                avoid_keys=set(recent[-8:]) | set(self.memory.level.fallback_recent_keys),
-                allow_blocked=True,
-            )
+        only_action6 = self._action6_is_only_forward_action(legal)
+        if "ACTION6" in legal_by_name and self._action6_budget_available(legal):
+            avoid = set(recent[-8:]) | set(self.memory.level.fallback_recent_keys)
+            cand = self._select_action6_candidate(scene, avoid_keys=avoid)
+            relaxed_recovery = False
+            if cand is None and only_action6:
+                cand = self._select_action6_candidate_allowing_state_noops(scene, avoid_keys=avoid)
+                relaxed_recovery = cand is not None
             if cand is not None:
-                key = self._action6_key_from_xy(cand.x, cand.y)
+                x, y = cand.x, cand.y
+                key = self._action6_key_from_xy(x, y)
                 self.logger.log_event(
                     "recovery_last_resort_action6_selected",
-                    {"action": key, "state": scene.state_hash[:12], "candidate_id": cand.candidate_id},
+                    {
+                        "action": key,
+                        "state": scene.state_hash[:12],
+                        "candidate_id": cand.candidate_id,
+                        "only_action6": only_action6,
+                        "relaxed_recovery": relaxed_recovery,
+                    },
                 )
                 return self._make_action6(
                     legal_by_name["ACTION6"],
-                    cand.x,
-                    cand.y,
+                    x,
+                    y,
                     {
                         "name": "ACTION6",
-                        "x": cand.x,
-                        "y": cand.y,
+                        "x": x,
+                        "y": y,
                         "target_object_id": cand.target_object_id,
                         "purpose": "last-resort non-reset recovery click",
                         "expected_change": "avoid active-level reset storm after proposal exhaustion",
                         "expected_predicates": [{"type": "no_retry"}],
-                        "relaxed_recovery": True,
+                        "relaxed_recovery": relaxed_recovery,
                     },
                 )
         return None
@@ -4423,7 +6354,7 @@ class MyAgent(_BaseAgent):
             return self._reset_action()
         level.recovery_mode = "proposal_recovery"
         level.recovery_reason = reason
-        level.recovery_until_step = max(level.recovery_until_step, level.total_action_count + 6)
+        level.recovery_until_step = max(level.recovery_until_step, self._controller_step() + 6)
         self.memory.game.controller_stats.recovery_counts[reason] += 1
 
         proposals: list[ActionProposal] = []
@@ -4628,6 +6559,25 @@ class MyAgent(_BaseAgent):
         self.memory.level.level_theories = self.memory.level.level_theories[:6]
         self.memory.level.active_theory_id = self.memory.level.level_theories[0].theory_id if self.memory.level.level_theories else ""
 
+    def _invalidate_or_downgrade_active_theory(self, reason: str, event_id: int) -> None:
+        tid = self.memory.level.active_theory_id
+        if not tid:
+            return
+        for theory in self.memory.level.level_theories:
+            if theory.theory_id != tid:
+                continue
+            if event_id not in theory.contradicting_event_ids:
+                theory.contradicting_event_ids.append(event_id)
+            theory.confidence = max(0.0, theory.confidence - 0.18)
+            if len(theory.contradicting_event_ids) >= 2 or theory.confidence < 0.2:
+                theory.status = "rejected"
+                self.memory.game.controller_stats.level_theory_updates["rejected"] += 1
+                self.logger.log_event("level_theory_invalidated", {**theory.as_prompt(), "reason": reason[:240]})
+            else:
+                self.memory.game.controller_stats.level_theory_updates["downgraded"] += 1
+                self.logger.log_event("level_theory_downgraded", {**theory.as_prompt(), "reason": reason[:240]})
+            break
+
     def _start_new_level(self, levels_completed: int, scene: SceneSnapshot) -> None:
         self.memory.game.levels_seen += 1
         start_stage = (
@@ -4671,6 +6621,8 @@ class MyAgent(_BaseAgent):
         self,
         current_scene: SceneSnapshot,
         latest_frame: Any,
+        *,
+        cross_level: bool = False,
     ) -> TransitionReport | None:
         pending = self.memory.level.pending_action
         if pending is None or id(latest_frame) == pending.source_frame_id:
@@ -4682,7 +6634,7 @@ class MyAgent(_BaseAgent):
         report.action_source = pending.source
         self.memory.level.last_resolved_pending_action = pending
         self.memory.level.pending_action = None
-        self._record_transition(pending, report, current_scene)
+        self._record_transition(pending, report, current_scene, cross_level=cross_level)
         return report
 
     def _record_transition(
@@ -4690,32 +6642,41 @@ class MyAgent(_BaseAgent):
         pending: PendingAction,
         report: TransitionReport,
         current_scene: SceneSnapshot,
+        *,
+        cross_level: bool = False,
     ) -> None:
         level = self.memory.level
         before_state = pending.scene_before.state_hash
         after_state = current_scene.state_hash
         action_key = pending.action_key()
-        attempts = level.action_attempt_counts_by_state.setdefault(before_state, {})
-        attempts[action_key] = attempts.get(action_key, 0) + 1
 
-        knowledge = self.memory.game.action_knowledge.setdefault(
-            pending.name,
-            ActionKnowledge(),
-        )
-        knowledge.attempts += 1
-        if report.effective_noop:
-            knowledge.blocked += 1
-            level.noop_actions_by_state.setdefault(before_state, set()).add(action_key)
-        else:
-            knowledge.successes += 1
-            level.transition_graph.setdefault(before_state, {})[action_key] = after_state
-        self._record_action_effect(knowledge, report)
+        # A cross-level transition compares the previous level's final scene with
+        # the next level's initial scene; that diff is a whole-screen artifact and
+        # must not pollute the persistent game-level action_knowledge (attempts,
+        # successes, movement vectors, effect scores) nor the soon-discarded
+        # level-state maps. We still record the event below for success causality.
+        if not cross_level:
+            attempts = level.action_attempt_counts_by_state.setdefault(before_state, {})
+            attempts[action_key] = attempts.get(action_key, 0) + 1
 
-        if report.controlled_candidate_id:
-            self._update_actor_identity(pending, report, current_scene, knowledge)
-        elif knowledge.attempts:
-            knowledge.status = "tentative"
-        knowledge.last_evidence = report.summary[:320]
+            knowledge = self.memory.game.action_knowledge.setdefault(
+                pending.name,
+                ActionKnowledge(),
+            )
+            knowledge.attempts += 1
+            if report.effective_noop:
+                knowledge.blocked += 1
+                level.noop_actions_by_state.setdefault(before_state, set()).add(action_key)
+            else:
+                knowledge.successes += 1
+                level.transition_graph.setdefault(before_state, {})[action_key] = after_state
+            self._record_action_effect(knowledge, report)
+
+            if report.controlled_candidate_id:
+                self._update_actor_identity(pending, report, current_scene, knowledge)
+            elif knowledge.attempts:
+                knowledge.status = "tentative"
+            knowledge.last_evidence = report.summary[:320]
 
         if report.counter_delta is not None:
             if report.counter_delta < 0:
@@ -4771,10 +6732,18 @@ class MyAgent(_BaseAgent):
             vlm_mode=pending.vlm_mode,
         )
         self._append_event(event)
+        effect_flags = self._transition_effect_flags(before_state, after_state, report)
+        self._update_fallback_transition_record(pending, report, current_scene, effect_flags)
+        self._record_anti_loop_escape_outcome(pending, report, current_scene, effect_flags, event)
         self._update_action6_memory_from_event(pending, report, current_scene, event)
+        self._detect_action6_nonprogress_loop(pending, report, current_scene, event)
         self._update_failure_model_from_event(pending, report, current_scene, event)
+        self._update_active_plan_after_transition(pending, report, event)
+        self._detect_nonprogress_primitive_loop(pending, report, current_scene, event)
+        if pending.source == "level_theory" and (report.effective_noop or report.retry_detected or predicate_check.get("failed_count", 0) > 0):
+            self._invalidate_or_downgrade_active_theory("level_theory_action_failed", event.event_id)
         self._detect_action6_drift_loop()
-        if predicate_check.get("failed_count", 0) > 0 and pending.source in {"vlm_plan", "plan_executor", "symbolic_nav"}:
+        if predicate_check.get("failed_count", 0) > 0 and pending.source in {"vlm_plan", "symbolic_nav", "active_plan"}:
             self._abort_plan("checkpoint_mismatch")
 
         if report.retry_detected:
@@ -4796,7 +6765,7 @@ class MyAgent(_BaseAgent):
             if report.interaction_event:
                 level.force_vlm_reason = "verified_object_or_state_transformation"
                 level.stage = V1Phase.OBJECT_EXPLORATION
-            if pending.source in {"vlm_plan", "symbolic_nav"} and not level.plan:
+            if pending.source in {"vlm_plan", "symbolic_nav", "active_plan"} and level.active_plan is None:
                 level.active_strategy_rule_id = ""
 
         self._detect_oscillation()
@@ -4829,7 +6798,7 @@ class MyAgent(_BaseAgent):
             local_patch_signature=self._local_patch_signature(before, pending.x, pending.y),
             outcome=outcome,
             event_id=event.event_id,
-            cooldown_until_step=self.memory.level.total_action_count + (self.config.action6_cooldown_steps if outcome == "noop" else 3),
+            cooldown_until_step=self._controller_step() + (self.config.action6_cooldown_steps if outcome == "noop" else 3),
         )
         self.memory.level.action6_memory.remember(rec)
 
@@ -4868,9 +6837,10 @@ class MyAgent(_BaseAgent):
         if same_type and same_patch and (monotone_x or monotone_y):
             level = self.memory.level
             self._abort_plan("action6_coordinate_drift_loop")
-            level.recovery_mode = "anti_loop"
+            level.recovery_mode = "escape_from_action6_loop"
             level.recovery_reason = "action6_drift"
-            level.recovery_until_step = level.total_action_count + 6
+            level.recovery_until_step = self._controller_step() + 8
+            self._disable_action_family("ACTION6", 8, "action6_drift_loop")
             if records:
                 last_key = self._action6_key_from_xy(records[-1].x, records[-1].y)
                 level.blocked_state_action_pairs.add((records[-1].state_hash, last_key))
@@ -4986,7 +6956,8 @@ class MyAgent(_BaseAgent):
         level.failed_lives.append(failure)
         level.life_index += 1
         level.life_action_count = 0
-        level.plan.clear()
+        level.active_plan = None
+        level.candidate_plans.clear()
         level.plan_goal = ""
         level.plan_target_id = ""
         level.active_strategy_rule_id = ""
@@ -5014,13 +6985,19 @@ class MyAgent(_BaseAgent):
         if actor is None or target is None or not self._object_reached(actor, target):
             return
         level = self.memory.level
-        if level.plan:
-            first = level.plan[0]
-            if (
-                _short_string(first.get("name"), 40).upper() == "NAVIGATE"
-                and _short_string(first.get("target_object_id"), 24).upper() == target_object_id
-            ):
-                level.plan.popleft()
+        plan = level.active_plan
+        if plan is None or plan.status != "active":
+            return
+        step = plan.current_step()
+        if step is None:
+            return
+        intent = step.intent
+        nav_target = intent.target_object_id
+        if intent.intent_type != IntentType.NAVIGATE_TO_OBJECT.value and intent.action_name != "NAVIGATE":
+            return
+        if nav_target and nav_target == target_object_id:
+            step.status = "done"
+            plan.cursor += 1
         level.recent_events.append(f"waypoint_reached={target_object_id}")
 
     def _record_target_failure(self, target_object_id: str, reason: str) -> None:
@@ -5067,9 +7044,9 @@ class MyAgent(_BaseAgent):
                 level.blocked_state_action_pairs.add((states[-1], actions[-1]))
             self._abort_plan("repeated_two_state_cycle")
             level.force_vlm_reason = "repeated_two_state_cycle"
-            level.recovery_mode = "anti_loop"
+            level.recovery_mode = "escape_from_primitive_loop"
             level.recovery_reason = "two_state_cycle"
-            level.recovery_until_step = level.total_action_count + 6
+            level.recovery_until_step = self._controller_step() + 6
             level.recent_events.append("two_state_cycle_detected")
             self.logger.log_event("loop_detected", {"kind": "two_state", "actions": actions[-8:], "states": [state[:12] for state in states[-8:]]})
             return
@@ -5085,17 +7062,19 @@ class MyAgent(_BaseAgent):
                 if actions and states:
                     level.blocked_state_action_pairs.add((states[-1], actions[-1]))
                 self._abort_plan("opposite_action_oscillation")
-                level.recovery_mode = "anti_loop"
+                level.recovery_mode = "escape_from_primitive_loop"
                 level.recovery_reason = "opposite_action_oscillation"
-                level.recovery_until_step = level.total_action_count + 6
+                level.recovery_until_step = self._controller_step() + 6
                 level.recent_events.append("opposite_action_oscillation_detected")
                 self.logger.log_event("loop_detected", {"kind": "opposite_actions", "actions": actions[-8:]})
 
     def _abort_plan(self, reason: str) -> None:
         level = self.memory.level
         abort_target = level.plan_target_id
-        if not abort_target and level.plan:
-            abort_target = _short_string(level.plan[0].get("target_object_id"), 24).upper()
+        if not abort_target and level.active_plan is not None:
+            step = level.active_plan.current_step()
+            if step is not None:
+                abort_target = _short_string(step.intent.target_object_id, 24).upper()
         if abort_target and reason in {
             "repeated_two_state_cycle",
             "opposite_action_oscillation",
@@ -5106,9 +7085,10 @@ class MyAgent(_BaseAgent):
         self._record_strategy_rule_failure(reason)
         if level.plan_goal == "resume_near_success_route":
             self._record_near_success_route_failure(reason)
-        if level.plan:
-            level.plan.clear()
-            level.plan_failures += 1
+        if level.active_plan is not None:
+            level.active_plan.status = "failed"
+            level.active_plan.failures += 1
+            self.logger.log_event("active_plan_failed", {**level.active_plan.as_prompt(), "reason": reason[:240]})
             self.logger.log_event(
                 "plan_aborted",
                 {
@@ -5118,6 +7098,7 @@ class MyAgent(_BaseAgent):
                     "life": level.life_index,
                 },
             )
+            level.active_plan = None
         level.plan_goal = ""
         level.plan_target_id = ""
         level.active_strategy_rule_id = ""
@@ -5441,7 +7422,8 @@ class MyAgent(_BaseAgent):
         level.attempt_index += 1
         level.life_index = 0
         level.life_action_count = 0
-        level.plan.clear()
+        level.active_plan = None
+        level.candidate_plans.clear()
         level.plan_goal = ""
         level.plan_target_id = ""
         level.active_strategy_rule_id = ""
@@ -5467,6 +7449,10 @@ class MyAgent(_BaseAgent):
         level.awaiting_reset = False
         level.recent_state_hashes.clear()
         level.recent_state_hashes.append(scene.state_hash)
+        # The pre-reset action history is stale after a restart; clearing it also
+        # lets the ACTION6 throttle window decay so a stuck window can never
+        # freeze the controller into a repeated terminal-reset loop.
+        level.recent_action_keys.clear()
         level.force_vlm_reason = "retry_after_game_over"
         level.recent_events.append(
             f"reset_observed attempt={level.attempt_index} state={scene.state_hash[:12]}"
@@ -5528,7 +7514,7 @@ class MyAgent(_BaseAgent):
         mechanism = level.mechanism
         if pending.name == "ACTION6":
             if report.effective_noop:
-                mechanism.note("click_selection", 0.25, "ACTION6 produced no visible effect")
+                mechanism.note("click_selection", -0.15, "ACTION6 produced no visible effect")
             else:
                 mechanism.note("click_selection", 1.6, "ACTION6 changed the scene")
         if report.controlled_candidate_id and report.is_simple_translation:
@@ -5718,30 +7704,36 @@ class MyAgent(_BaseAgent):
             route.last_resumed_life = level.life_index
             route.last_resumed_attempt = level.attempt_index
             route.cooldown_until = level.total_action_count + max(8, min(24, len(safe) + 4))
-            level.plan_id += 1
-            level.plan = deque(
+            steps = [
                 {
-                    "name": name,
+                    "action": name,
                     "target_object_id": route.target_id,
                     "purpose": "resume near-success route without repeating the terminal action",
                     "expected_change": "make progress while avoiding the last retry-causing suffix",
                 }
                 for name in safe
-            )
-            level.plan_goal = "resume_near_success_route"
-            level.plan_target_id = route.target_id
+            ]
             level.active_strategy_rule_id = ""
             level.active_near_success_route_id = route.route_id
-            level.stage = V1Phase.SOLVE
-            self.logger.log_event(
-                "near_success_route_resumed",
-                {
+            started = self._start_deterministic_active_plan(
+                "near_success_route",
+                "resume_near_success_route",
+                route.target_id,
+                steps,
+                scene,
+                legal,
+                log_event="near_success_route_resumed",
+                log_payload={
                     **route.as_prompt(),
                     "level": level.level_index,
-                    "plan_id": level.plan_id,
                     "steps": safe,
                 },
             )
+            if not started:
+                route.failures += 1
+                route.cooldown_until = level.total_action_count + 12
+                level.recent_events.append(f"near_success_route_skipped_preflight={route.route_id}")
+                continue
             return True
         return False
 
@@ -5871,15 +7863,16 @@ class MyAgent(_BaseAgent):
                     },
                 )
                 continue
-            level.plan_id += 1
-            level.plan = deque(safe_steps[: self.config.plan_horizon])
-            level.plan_goal = f"strategy_rule:{rule.kind}:{rule.rule_id}"
-            level.plan_target_id = ""
             level.active_strategy_rule_id = rule.rule_id
-            level.stage = V1Phase.SOLVE
-            self.logger.log_event(
-                "strategy_rule_applied",
-                {
+            return self._start_deterministic_active_plan(
+                f"strategy_rule:{rule.kind}",
+                f"strategy_rule:{rule.kind}:{rule.rule_id}",
+                "",
+                safe_steps[: self.config.plan_horizon],
+                scene,
+                legal,
+                log_event="strategy_rule_applied",
+                log_payload={
                     "rule_id": rule.rule_id,
                     "kind": rule.kind,
                     "level": level.level_index,
@@ -5888,7 +7881,6 @@ class MyAgent(_BaseAgent):
                     "steps": safe_steps[: self.config.plan_horizon],
                 },
             )
-            return True
         return False
 
     def _strategy_rule_scene_compatible(self, rule: ExecutableStrategyRule, scene: SceneSnapshot) -> bool:
@@ -5977,6 +7969,13 @@ class MyAgent(_BaseAgent):
             )
         return False
 
+    def _repair_window_active(self) -> bool:
+        level = self.memory.level
+        return bool(
+            level.recovery_mode
+            and (not level.recovery_until_step or self._controller_step() <= level.recovery_until_step)
+        )
+
     def _choose_vlm_mode(
         self,
         scene: SceneSnapshot,
@@ -5992,6 +7991,8 @@ class MyAgent(_BaseAgent):
         ):
             return None
         reason = level.force_vlm_reason.strip()
+        if (reason == "repair_decision" or level.recovery_mode) and self._repair_window_active():
+            return VLMMode.REPAIR_DECISION
         if reason in {"retry_after_game_over", "internal_retry_counter_exhausted"}:
             return VLMMode.FAILURE_REPAIR
         if reason in {"planned_action_was_noop", "repeated_two_state_cycle", "checkpoint_mismatch", "action6_coordinate_drift_loop", "retry_invalid_vlm_output"}:
@@ -6006,7 +8007,7 @@ class MyAgent(_BaseAgent):
             level.local_goal or level.goal_instantiation
         ):
             return VLMMode.PLAN_SYNTHESIS
-        if not level.plan and level.actions_since_vlm >= self.config.vlm_min_action_gap:
+        if not level.active_plan and level.actions_since_vlm >= self.config.vlm_min_action_gap:
             if self._choose_semantic_target(scene) is None:
                 remaining = self.config.max_vlm_calls_per_level - level.vlm_calls_this_level
                 if level.life_index == 0 and remaining <= self.config.vlm_retry_reserve:
@@ -6071,14 +8072,24 @@ class MyAgent(_BaseAgent):
                 },
             )
             return None
+        if result.mode == "INVALID_PARTIAL":
+            self.memory.game.total_vlm_errors += 1
+            level.vlm_invalid_streak += 1
+            if level.vlm_invalid_streak <= 1:
+                level.force_vlm_reason = "retry_invalid_vlm_output"
+            self.logger.log_event(
+                "vlm_invalid_salvaged",
+                {"reason": mode_value, "raw_excerpt": result.proposed_memory_patch.get("raw_invalid_vlm_excerpt", "")[:500]},
+            )
+            return result
         level.vlm_invalid_streak = 0
         result.mode = result.mode or mode_value
+        contract_counts = _vlm_contract_counts(result)
         self.logger.log_event(
             "vlm_result_parsed",
             {
                 "mode": result.mode,
-                "experiments": len(result.recommended_experiments),
-                "plan_proposals": len(result.plan_proposals) + len(result.plan),
+                **contract_counts,
                 "has_schema_patch": bool(result.goal_schema_patch),
             },
         )
@@ -6136,7 +8147,7 @@ class MyAgent(_BaseAgent):
                 "how_to_use": [
                     "Use level_memory.current_state.known_noops to avoid repeating known no-op actions in this exact state.",
                     "Use level_memory.target_failure_policy.hard_blocks_current_life for current-life hard target blocks; failed_targets counts are soft history after a new life.",
-                    "Prefer intent_proposals over raw plan. Use action6_candidates candidate_id via click_candidate when available; do not hand-copy coordinates unless needed.",
+                    "Prefer decision.kind/intents over raw action fields. Use action6_candidates candidate_id via click_candidate when available; do not hand-copy coordinates unless needed.",
                     "Use active level_theories and update them from transition evidence.",
                     "Use game_memory.action_knowledge vectors/effect_score to infer action effects, but keep uncertainty when evidence is weak.",
                     "Use recent_event_log event_ids when writing hypothesis_updates or goal_schema_patch evidence.",
@@ -6182,12 +8193,14 @@ class MyAgent(_BaseAgent):
                 "ACTION7": "undo-only; do not propose",
                 "RESET": "terminal/recovery only; do not propose for exploration",
                 "ACTION6": "compiler-owned coordinate action; prefer click_candidate/action6_candidate_id or click_object/target_object_id",
+                "disabled_action_families": dict(self.memory.level.disabled_action_families_until),
+                "nonprogress_policy": "When a primitive repeatedly causes structural/resource changes without movement, interaction, or goal progress, treat it as suspected undo/resource churn and avoid it unless new evidence requires it.",
             },
             "output_action_contract": {
                 "valid_names": sorted(set(legal_names + ["NAVIGATE"])),
                 "internal_navigation": "Use {intent: navigate_to_object, target_object_id: O3}; legacy {action: NAVIGATE, target_object_id: O3} is also accepted.",
                 "simple_action_example": "Use {intent: primitive_action, action: ACTION1, target_object_id: O1, purpose: ...}; do not emit free text like MOVE O1 UP.",
-                "action6_example": "Prefer {intent: click_candidate, action6_candidate_id: A6C03}. For object clicks use {intent: click_object, target_object_id: O2}.",
+                "action6_example": "Prefer {intent: click_candidate, action6_candidate_id: A6_xxxxxx}. For object clicks use {intent: click_object, target_object_id: O2}.",
             },
             "mechanism_classifier": self.memory.level.mechanism.summary(),
             "strategy_rules": [
@@ -6208,6 +8221,7 @@ class MyAgent(_BaseAgent):
                     self.memory.level.noop_actions_by_state.get(scene.state_hash, set())
                 ),
             },
+            "repair_candidates": list(self.memory.level.repair_action_candidates)[:12],
             "requirements": [
                 "Use object IDs from the annotated image and object table.",
                 "Return experiments when the mode is EXPERIMENT_DESIGN; include predictions and expected_predicates.",
@@ -6215,7 +8229,7 @@ class MyAgent(_BaseAgent):
                 "When a compact object is an untested possible transformer, prefer testing it before repeatedly colliding with a mismatched frame.",
                 "Use NAVIGATE plus target_object_id for visible waypoints; do not invent low-level maze paths when the controller can pathfind.",
                 "Treat failed_targets as soft penalties; only avoid targets listed as current hard blocks by target_failure_policy unless new evidence supports retry.",
-                "Prefer intent_proposals over raw plan. NAVIGATE is only an intent and the controller will compile it to a primitive action.",
+                "Prefer decision.kind/intents over raw plan. NAVIGATE is only an intent and the controller will compile it to a primitive action.",
                 "Do not hand-copy ACTION6 coordinates when an action6_candidate_id is available. Use click_candidate with action6_candidate_id.",
                 "During INIT_ANALYSIS, produce level_theory before proposing actions. During later modes, update or invalidate level_theory based on transition evidence.",
                 "Use discriminating_tests from active level_theory before falling back to random exploration.",
@@ -6273,46 +8287,37 @@ class MyAgent(_BaseAgent):
                         {"intent": "test_object", "target_object_id": "O2", "purpose": "..."}
                     ],
                     "discriminating_tests": [
-                        {"intent": "click_candidate", "action6_candidate_id": "A6C03", "expected_predicates": [{"type": "transform"}]}
+                        {"intent": "click_candidate", "action6_candidate_id": "A6_xxxxxx", "expected_predicates": [{"type": "transform"}]}
                     ],
                     "expected_progress_signals": [{"type": "transform"}, {"type": "movement"}, {"type": "counter_delta_nonpositive"}],
                     "invalidating_evidence": ["what observation would disprove this theory"],
                     "confidence": 0.0,
                 },
-                "intent_proposals": [
-                    {
-                        "intent": "click_candidate",
-                        "action6_candidate_id": "A6C03",
-                        "target_object_id": "O2",
-                        "purpose": "test if O2 changes the frame/status",
-                        "expected_predicates": [{"type": "transform"}],
-                        "risk": "low",
-                        "information_gain": 0.7,
-                        "goal_progress": 0.2,
-                    }
-                ],
-                "recommended_experiments": [
-                    {
-                        "action": "ACTION1",
-                        "purpose": "distinguish hypotheses",
-                        "expected_predicates": [{"type": "not_noop"}],
-                        "risk": "low",
-                        "information_gain": 0.5,
-                    }
-                ],
-                "plan_proposals": [
-                    {
-                        "action": "NAVIGATE",
-                        "target_object_id": "O3",
-                        "purpose": "",
-                        "expected_predicates": [{"type": "movement"}],
-                    }
-                ],
+                "decision": {
+                    "kind": "memory_update_only|single_experiment|plan_candidate|repair_decision",
+                    "goal": "",
+                    "confidence": 0.0,
+                    "evidence_level": 0,
+                    "selected_repair_candidate_id": "RP_XXXXXXXXXX",
+                    "rationale": "why this controller-provided repair candidate is preferred",
+                    "intents": [
+                        {
+                            "intent": "primitive_action|navigate_to_object|click_candidate|click_object|test_object",
+                            "action": "ACTION1",
+                            "target_object_id": "O2",
+                            "action6_candidate_id": "A6_xxxxxx",
+                            "purpose": "",
+                            "expected_predicates": [{"type": "not_noop"}],
+                            "risk": "low",
+                            "information_gain": 0.0,
+                            "goal_progress": 0.0,
+                        }
+                    ],
+                },
+                "intent_proposals": [],
                 "goal_schema_patch": {},
                 "level_instantiation_patch": {},
                 "failure_constraints": [],
-                "plan": [],
-                "next_action": {},
                 "game_summary": "advisory hypotheses only",
                 "level_summary": "advisory current-level hypotheses only",
             },
@@ -6340,6 +8345,14 @@ class MyAgent(_BaseAgent):
                 "Prefer schema_transfer or vlm_transfer proposals only when role bindings are grounded in observer facts.",
                 "Return intent_proposals and short validating experiments for uncertain slots.",
             ]
+        elif mode == VLMMode.REPAIR_DECISION.value:
+            payload["mode_instructions"] = [
+                "Explain the controller failure using recent_event_log, recovery, compile_failures, nonprogress_action_records, and failure_model.",
+                "Choose from repair_candidates only: return decision.kind=repair_decision with selected_repair_candidate_id and rationale, or memory_update_only if none are safe.",
+                "Do not emit free-form repair intents/actions in REPAIR_DECISION; target_object_id hints may be included only to rank ACTION6 candidate frontier search.",
+                "If recovery.reason mentions nonprogress/resource/undo, identify which primitive is likely churn or resource-consuming and state what evidence would justify trying it again.",
+                "The deterministic RepairPolicy validates and emits the final action.",
+            ]
         elif mode == VLMMode.FAILURE_REPAIR.value:
             payload["mode_instructions"] = [
                 "Explain the likely failure cause using recent_event_log, retry/game-over evidence, and failure_model.",
@@ -6356,7 +8369,7 @@ class MyAgent(_BaseAgent):
         elif mode == VLMMode.PLAN_SYNTHESIS.value:
             payload["mode_instructions"] = [
                 "Synthesize a short validated plan from current goal_instantiation and known mechanics.",
-                "Each plan_proposal must include target_object_id where relevant and expected_predicates checkpoints.",
+                "Return decision.kind=plan_candidate with intents; each intent should include target_object_id where relevant and expected_predicates checkpoints.",
                 "Prefer NAVIGATE for visible waypoints and avoid long raw action loops.",
             ]
         else:
@@ -6420,7 +8433,20 @@ class MyAgent(_BaseAgent):
             "controlled_actor_confidence": round(level.controlled_actor_confidence, 3),
             "mechanism_classifier": level.mechanism.summary(),
             "current_plan_goal": level.plan_goal,
-            "remaining_plan": list(level.plan)[: self.config.plan_horizon],
+            "active_plan": self._active_plan_prompt(),
+            "candidate_plans": [plan.as_prompt() for plan in list(level.candidate_plans)[:6]],
+            "disabled_action_families_until": dict(level.disabled_action_families_until),
+            "nonprogress_action_records": list(level.nonprogress_action_records)[-12:],
+            "suspicious_action_counts": dict(level.suspicious_action_counts),
+            "fallback_action_records": list(level.fallback_action_records)[-12:],
+            "repair_action_candidates": list(level.repair_action_candidates)[:12],
+            "vlm_repair_choice": _json_safe(level.vlm_repair_choice),
+            "anti_loop_escape_failures": level.anti_loop_escape_failures,
+            "last_repair_vlm": {
+                "reason": level.last_repair_vlm_reason,
+                "step": level.last_repair_vlm_step,
+            },
+            "last_compile_failures": list(level.last_compile_failures)[-8:],
             "total_steps": level.total_action_count,
             "life_steps": level.life_action_count,
             "vlm_calls": level.vlm_calls_this_level,
@@ -6559,6 +8585,11 @@ class MyAgent(_BaseAgent):
             self.memory.game.advisory_summary = result.game_summary[:700]
         if result.level_summary:
             level.advisory_summary = result.level_summary[:700]
+        invalid_excerpt = ""
+        if isinstance(result.proposed_memory_patch, dict):
+            invalid_excerpt = _short_string(result.proposed_memory_patch.get("raw_invalid_vlm_excerpt"), 700)
+        if invalid_excerpt:
+            level.advisory_summary = _short_string(f"{level.advisory_summary} Invalid VLM advisory excerpt: {invalid_excerpt}", 900)
 
         for claim in result.rejected_hypotheses:
             self._reject_belief(claim, "VLM explicitly rejected it after new evidence")
@@ -6709,151 +8740,6 @@ class MyAgent(_BaseAgent):
                     level.attempt_index,
                 )
 
-        safe_plan = self._sanitize_plan(result, scene, legal)
-        if safe_plan and not self.config.enable_proposal_controller:
-            level.plan_quality_rejections = 0
-            level.plan_id += 1
-            level.plan = deque(safe_plan)
-            level.plan_goal = result.plan_goal or level.local_goal
-            level.plan_target_id = result.target_object_id
-            level.force_vlm_reason = ""
-            level.stage = V1Phase.EXECUTE_PLAN
-            self.logger.log_event(
-                "plan_created",
-                {
-                    "plan_id": level.plan_id,
-                    "goal": level.plan_goal,
-                    "target": level.plan_target_id,
-                    "steps": safe_plan,
-                },
-            )
-
-    def _sanitize_plan(
-        self,
-        result: VLMResult,
-        scene: SceneSnapshot,
-        legal: Sequence[Any],
-    ) -> list[dict[str, Any]]:
-        legal_names = {action_name(action) for action in legal}
-        raw_proposed = result.plan or ([result.next_action] if result.next_action else [])
-        proposed = [
-            self._normalize_vlm_action_item(dict(raw))
-            for raw in raw_proposed[: self.config.plan_horizon]
-            if isinstance(raw, dict)
-        ]
-        proposed_names = [
-            _short_string(item.get("name") or item.get("action"), 40).upper()
-            for item in proposed
-        ]
-        loop_reason = self._raw_loop_reason(proposed_names)
-        if loop_reason:
-            self._reject_plan_quality_gate(loop_reason, proposed_names)
-            return []
-        if self._repeated_single_raw_without_grounding(proposed_names):
-            self._reject_plan_quality_gate("repeated_single_global_raw_action", proposed_names)
-            return []
-        if len(proposed_names) > 6 and "NAVIGATE" not in proposed_names:
-            has_grounding = bool(result.target_object_id) or any(
-                item.get("target_object_id") or item.get("purpose") or item.get("expected_change")
-                for item in proposed
-            )
-            if not has_grounding:
-                self._reject_plan_quality_gate("long_ungrounded_raw_plan", proposed_names)
-                return []
-
-        safe: list[dict[str, Any]] = []
-        reserved_action6_keys: set[str] = set()
-        for raw in proposed:
-            item = dict(raw)
-            if result.target_object_id and not item.get("target_object_id"):
-                item["target_object_id"] = result.target_object_id
-            name = _short_string(item.get("name") or item.get("action"), 40).upper()
-            target = _short_string(item.get("target_object_id"), 24).upper()
-            if name in {"CLICK", "MOVE", "GO", "PATHFIND"}:
-                self._note_plan_reject(RejectReason.UNSUPPORTED_ACTION_TOKEN, name)
-                continue
-            if name == "RESET":
-                self._note_plan_reject(RejectReason.RESET_NOT_ALLOWED, "VLM plan attempted RESET")
-                continue
-            if name == "ACTION7":
-                self._note_plan_reject(RejectReason.ACTION7_UNDO_ONLY, "VLM plan attempted ordinary ACTION7")
-                continue
-            if name == "NAVIGATE":
-                if not safe and self._premature_frame_target(item, scene):
-                    rejected_target = _short_string(item.get("target_object_id"), 24).upper()
-                    self._record_target_failure(
-                        rejected_target,
-                        "framed target pattern mismatches status/template while an untested compact object remains",
-                    )
-                    self.memory.level.recent_events.append(f"rejected_premature_frame_target={rejected_target}")
-                    return []
-                intent = self._intent_from_action_item(item, "vlm_plan")
-                compiled = self._compile_intent(intent, scene, legal) if intent is not None else None
-                if compiled is None or not compiled.ok or compiled.proposal is None:
-                    status = compiled.status if compiled is not None else CompileStatus.UNSUPPORTED_INTENT
-                    detail = compiled.detail if compiled is not None else str(item)
-                    self._note_plan_reject(self._compile_reject_reason(status), detail)
-                    continue
-                item = compiled.proposal.to_plan_step()
-                item["source"] = "vlm_plan"
-                name = _short_string(item.get("name"), 40).upper()
-                target = _short_string(item.get("target_object_id"), 24).upper()
-            if name not in legal_names:
-                self._note_plan_reject(RejectReason.ILLEGAL_ACTION, name)
-                continue
-            if target and self._target_blocked(target, scene):
-                self._note_plan_reject(RejectReason.TARGET_BLOCKED, target)
-                continue
-            if name == "ACTION6":
-                completed = self._complete_action6_proposal(
-                    item,
-                    result,
-                    scene,
-                    avoid_keys=reserved_action6_keys,
-                )
-                if completed is None:
-                    self._note_plan_reject(RejectReason.ACTION6_BAD_COORD, str(item))
-                    continue
-                item = completed
-                x = self._coerce_int(item.get("x"))
-                y = self._coerce_int(item.get("y"))
-                target = _short_string(item.get("target_object_id"), 24).upper()
-                if x is None or y is None or not (0 <= x < scene.width and 0 <= y < scene.height):
-                    self._note_plan_reject(RejectReason.ACTION6_BAD_COORD, str(item))
-                    continue
-                proposal = ActionProposal(
-                    source="vlm_plan",
-                    action_name="ACTION6",
-                    x=x,
-                    y=y,
-                    target_object_id=target,
-                    raw=dict(item),
-                )
-                cand = self._proposal_to_action6_candidate(proposal, scene)
-                if cand is not None and self._action6_candidate_blocked(cand, scene):
-                    self._note_plan_reject(RejectReason.ACTION6_DUPLICATE_OR_COOLDOWN, cand.key())
-                    continue
-                key = self._action6_key_from_xy(x, y)
-                reserved_action6_keys.add(key)
-            else:
-                key = name
-            if key in self.memory.level.noop_actions_by_state.get(scene.state_hash, set()):
-                self._note_plan_reject(RejectReason.KNOWN_NOOP, key)
-                continue
-            item["name"] = name
-            item["target_object_id"] = target
-            item["source"] = item.get("source") or "vlm_plan"
-            safe.append(item)
-        if safe and self._premature_frame_target(safe[0], scene):
-            rejected_target = _short_string(safe[0].get("target_object_id"), 24).upper()
-            self._record_target_failure(
-                rejected_target,
-                "framed target pattern mismatches status/template while an untested compact object remains",
-            )
-            self.memory.level.recent_events.append(f"rejected_premature_frame_target={rejected_target}")
-            return []
-        return safe
-
     def _premature_frame_target(
         self,
         step: dict[str, Any],
@@ -6982,13 +8868,15 @@ class MyAgent(_BaseAgent):
         scene: SceneSnapshot,
         target_id: str,
         legal: Sequence[Any],
+        *,
+        use_weak_vectors: bool = True,
     ) -> list[str] | None:
         level = self.memory.level
         actor = scene.object_by_id(level.controlled_object_id)
         target = scene.object_by_id(target_id)
         if actor is None or target is None:
             return None
-        vectors = self._action_vectors(actor, legal)
+        vectors = self._action_vectors(actor, legal) if use_weak_vectors else self._grounded_action_vectors(legal)
         if not vectors:
             return None
         floor_colors = self._walkable_colors(scene, actor)
@@ -7211,6 +9099,13 @@ class MyAgent(_BaseAgent):
         action = get_action_by_name(name)
         if action is None:
             return None
+        allow_disabled_action6_frontier = bool(
+            name == "ACTION6"
+            and _short_string(proposal.get("source"), 80) == "action6_frontier"
+            and proposal.get("family_disabled_bypass")
+        )
+        if name != "RESET" and self._action_family_disabled(name) and not allow_disabled_action6_frontier:
+            return None
         legal_by_value = {action_value(item): item for item in legal}
         if action_value(action) not in legal_by_value and name != "RESET":
             return None
@@ -7291,10 +9186,17 @@ class MyAgent(_BaseAgent):
         if proposal.get("name") == "ACTION6" or proposal.get("x") is not None or proposal.get("y") is not None:
             reasoning["x"] = proposal.get("x")
             reasoning["y"] = proposal.get("y")
+        for extra_key in ("name", "candidate_id", "candidate_kind", "relaxed_recovery"):
+            if extra_key in proposal:
+                reasoning[extra_key] = proposal.get(extra_key)
         try:
             setattr(action, "reasoning", reasoning)
+            return action
         except Exception:
-            pass
+            data = action6_data(action) if action_name(action) == "ACTION6" else None
+            if data is not None:
+                base = getattr(action, "id", None) or get_action_by_name("ACTION6") or action
+                return ActionWithData(base, data, reasoning)
         return action
 
     def _action_key_for_action(self, action: Any) -> str:
@@ -7333,16 +9235,37 @@ class MyAgent(_BaseAgent):
             reasoning = getattr(action, "reasoning", None)
             proposal = reasoning if isinstance(reasoning, dict) else {}
         key = self._action_key_for_action(action)
+        level = self.memory.level
         if name == "RESET":
-            self.memory.level.pending_action = None
+            level.controller_tick_count += 1
+            level.terminal_reset_streak += 1
+            if _short_string(proposal.get("reason"), 80) == "no_safe_non_reset_action":
+                level.no_safe_recovery_streak += 1
+                level.force_vlm_reason = "recovery_no_safe_action"
+            level.pending_action = None
+            self.logger.log_event(
+                "terminal_reset_returned",
+                {
+                    "source": source,
+                    "reason": _short_string(proposal.get("reason"), 160),
+                    "streak": level.terminal_reset_streak,
+                    "no_safe_streak": level.no_safe_recovery_streak,
+                    "controller_step": self._controller_step(),
+                    "recovery_mode": level.recovery_mode,
+                    "recovery_until": level.recovery_until_step,
+                },
+            )
             return
 
-        level = self.memory.level
+        level.terminal_reset_streak = 0
+        level.no_safe_recovery_streak = 0
         level.tried_actions_by_state.setdefault(scene.state_hash, set()).add(key)
         level.total_action_count += 1
+        level.controller_tick_count = max(level.controller_tick_count + 1, level.total_action_count)
         level.life_action_count += 1
         level.actions_since_vlm += 1
         level.action_trace.append(key)
+        self._note_fallback_selection(source, key, scene)
 
         x = y = None
         if name == "ACTION6" and ":" in key:
@@ -7377,7 +9300,7 @@ class MyAgent(_BaseAgent):
             source_frame_id=id(latest_frame),
             issued_call=self._call_index,
             source=source,
-            plan_id=level.plan_id if source in {"vlm_plan", "plan_executor", "symbolic_nav"} else None,
+            plan_id=level.plan_id if source in {"vlm_plan", "symbolic_nav", "active_plan"} else None,
             source_frame_ref=latest_frame,
             expected_predicates=expected_predicates[:8],
             available_actions_before=available_before,
@@ -7391,8 +9314,12 @@ class MyAgent(_BaseAgent):
                 "action": key,
                 "source": source,
                 "target_object_id": target,
-                "plan_id": level.plan_id if source in {"vlm_plan", "plan_executor", "symbolic_nav"} else None,
-                "plan_remaining": len(level.plan),
+                "plan_id": level.plan_id if source in {"vlm_plan", "symbolic_nav", "active_plan"} else None,
+                "plan_remaining": (
+                    max(0, len(level.active_plan.steps) - level.active_plan.cursor)
+                    if level.active_plan is not None
+                    else 0
+                ),
                 "level": level.level_index,
                 "attempt": level.attempt_index,
                 "life": level.life_index,
@@ -7411,7 +9338,7 @@ class MyAgent(_BaseAgent):
         level = self.memory.level
         if level.awaiting_reset:
             level.stage = V1Phase.FAILURE_RECOVERY
-        elif level.plan:
+        elif level.active_plan is not None:
             level.stage = V1Phase.EXECUTE_PLAN
         elif level.total_action_count <= 2 and (self.memory.game.goal_schemas or self.memory.game.level_outcomes):
             level.stage = V1Phase.TRANSFER_BOOTSTRAP
