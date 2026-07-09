@@ -157,12 +157,10 @@ class AgentConfig:
     max_chunk_steps: int = 4
     max_plan_steps: int = 32
     max_prompt_objects: int = 32
-    max_recent_events: int = 14
     navigation_max_depth: int = 96
     nonterminal_reset_allowed: bool = False
     log_dir: str | None = "./runs/agent_v2_0"
-    debug: bool = False
-    log_vlm_io: bool = True
+    log_vlm_io: bool = False
     vlm_backend: str = "local"
     vlm_api_base_url: str | None = None
     vlm_api_key: str | None = None
@@ -189,6 +187,23 @@ class AgentConfig:
     resource_plan_max_steps: int = 4
     vlm_repeat_bottleneck_cooldown: int = 3
     force_source_fuse_after: int = 20
+    churn_click_fuse_after: int = 4
+    churn_state_visit_cap: int = 3
+    # Pace the per-level VLM budget across the whole episode instead of letting
+    # bottleneck storms burn it in the first ~25 actions (ls20/ft09 pattern).
+    vlm_budget_burst: int = 4
+    # Cells that change in >= this fraction of observed frame-to-frame transitions
+    # are treated as self-drifting animation and excluded from the navigation hash.
+    drift_cell_ratio: float = 0.6
+    escape_commit_max_run: int = 4
+    # 阶段性决策：ACTION7 视为回退、完全回避（先追求通关）。置 1 可恢复
+    # “小词表且声明含 ACTION7 时允许 2 次有界探测”（bp35 曾探出 transform 机制）。
+    action7_space_probe: bool = False
+    # V2.7: do not permanently lock geometry navigation until the attempt has had
+    # enough directed exploration. ls20 previously escalated ~step 30 (fuel still
+    # high) off a short transform_state_cycle and then rejected geometry for the
+    # rest of the level. Direct escalate() calls / tests can set total_action_count.
+    min_hypothesis_escalation_actions: int = 48
 
     @classmethod
     def from_env(cls) -> "AgentConfig":
@@ -203,12 +218,10 @@ class AgentConfig:
             max_chunk_steps=_int_env(("ARC_V20_MAX_CHUNK_STEPS", "ARC_V19_MAX_CHUNK_STEPS", "ARC_V18_MAX_CHUNK_STEPS"), 4, 1, 12),
             max_plan_steps=_int_env(("ARC_V20_MAX_PLAN_STEPS", "ARC_V19_MAX_PLAN_STEPS", "ARC_V18_MAX_PLAN_STEPS"), 32, 1, 32),
             max_prompt_objects=_int_env(("ARC_V20_MAX_PROMPT_OBJECTS", "ARC_V19_MAX_PROMPT_OBJECTS", "ARC_V18_MAX_PROMPT_OBJECTS"), 32, 4, 40),
-            max_recent_events=_int_env(("ARC_V20_MAX_RECENT_EVENTS", "ARC_V19_MAX_RECENT_EVENTS", "ARC_V18_MAX_RECENT_EVENTS"), 14, 4, 64),
             navigation_max_depth=_int_env(("ARC_V20_NAVIGATION_MAX_DEPTH", "ARC_V19_NAVIGATION_MAX_DEPTH", "ARC_V18_NAVIGATION_MAX_DEPTH", "ARC_V15_NAVIGATION_MAX_DEPTH"), 96, 8, 512),
             nonterminal_reset_allowed=_bool_env(("ARC_V20_ALLOW_NONTERMINAL_RESET", "ARC_V19_ALLOW_NONTERMINAL_RESET", "ARC_V18_ALLOW_NONTERMINAL_RESET"), False),
             log_dir=_str_env(("ARC_V20_LOG_DIR", "ARC_V19_LOG_DIR", "ARC_V18_LOG_DIR", "ARC_V15_LOG_DIR"), "./runs/agent_v2_0"),
-            debug=_bool_env(("ARC_V20_DEBUG", "ARC_V19_DEBUG", "ARC_V18_DEBUG", "ARC_V15_DEBUG"), False),
-            log_vlm_io=_bool_env(("ARC_V20_LOG_VLM_IO",), True),
+            log_vlm_io=_bool_env(("ARC_V20_LOG_VLM_IO",), False),
             vlm_backend=_str_env(("ARC_V20_VLM_BACKEND", "ARC_V19_VLM_BACKEND", "ARC_V18_VLM_BACKEND", "ARC_V15_VLM_BACKEND"), "local") or "local",
             vlm_api_base_url=_str_env(("ARC_V20_VLM_API_BASE_URL", "ARC_V19_VLM_API_BASE_URL", "ARC_V18_VLM_API_BASE_URL", "ARC_V15_VLM_API_BASE_URL")),
             vlm_api_key=_str_env(("ARC_V20_VLM_API_KEY", "ARC_V19_VLM_API_KEY", "ARC_V18_VLM_API_KEY", "ARC_V15_VLM_API_KEY", "INF_API_KEY")),
@@ -234,6 +247,13 @@ class AgentConfig:
             resource_plan_max_steps=_int_env(("ARC_V20_RESOURCE_PLAN_MAX_STEPS",), 4, 1, 16),
             vlm_repeat_bottleneck_cooldown=_int_env(("ARC_V20_VLM_REPEAT_BOTTLENECK_COOLDOWN",), 3, 1, 20),
             force_source_fuse_after=_int_env(("ARC_V20_FORCE_SOURCE_FUSE_AFTER",), 20, 4, 200),
+            churn_click_fuse_after=_int_env(("ARC_V20_CHURN_CLICK_FUSE_AFTER",), 4, 2, 50),
+            churn_state_visit_cap=_int_env(("ARC_V20_CHURN_STATE_VISIT_CAP",), 3, 2, 50),
+            vlm_budget_burst=_int_env(("ARC_V20_VLM_BUDGET_BURST",), 4, 1, 100),
+            drift_cell_ratio=_float_env(("ARC_V20_DRIFT_CELL_RATIO",), 0.6, 0.2, 1.0),
+            escape_commit_max_run=_int_env(("ARC_V20_ESCAPE_COMMIT_MAX_RUN",), 4, 1, 20),
+            action7_space_probe=_bool_env(("ARC_V20_ACTION7_SPACE_PROBE",), False),
+            min_hypothesis_escalation_actions=_int_env(("ARC_V20_MIN_HYPOTHESIS_ESCALATION_ACTIONS",), 48, 0, 200),
         )
 
 
@@ -456,8 +476,11 @@ class TransitionReport:
 
 
 class Observer:
-    def __init__(self, image_size: int = 512):
+    DRIFT_MIN_SAMPLES = 8
+
+    def __init__(self, image_size: int = 512, drift_cell_ratio: float = 0.6):
         self.image_size = image_size
+        self.drift_cell_ratio = drift_cell_ratio
         self._last_grid: tuple[tuple[int, ...], ...] | None = None
         self._previous_objects: tuple[ObjectObservation, ...] = ()
         self._next_track_id = 1
@@ -467,6 +490,11 @@ class Observer:
         self._counter_capacity: int | None = None
         self._life_slots: list[tuple[tuple[int, int, int, int], int]] = []
         self._structural_colors: set[int] = set()
+        self._drift_prev_grid: tuple[tuple[int, ...], ...] | None = None
+        self._drift_change_counts: Counter[tuple[int, int]] = Counter()
+        self._drift_samples = 0
+        self.drift_cells: frozenset[tuple[int, int]] = frozenset()
+        self._bar_counter_candidates: dict[tuple[int, int, int], dict[str, Any]] = {}
 
     def reset_level(self) -> None:
         self._previous_objects = ()
@@ -477,6 +505,11 @@ class Observer:
         self._counter_capacity = None
         self._life_slots = []
         self._structural_colors = set()
+        self._drift_prev_grid = None
+        self._drift_change_counts = Counter()
+        self._drift_samples = 0
+        self.drift_cells = frozenset()
+        self._bar_counter_candidates = {}
 
     @staticmethod
     def normalize_grid_value(raw_grid: Any) -> tuple[tuple[int, ...], ...]:
@@ -514,12 +547,37 @@ class Observer:
             self._last_grid = grid
         return self.analyze_grid(grid, render_grid(grid, self.image_size))
 
+    def _update_drift_model(self, grid: tuple[tuple[int, ...], ...]) -> None:
+        prev = self._drift_prev_grid
+        self._drift_prev_grid = grid
+        if prev is None or len(prev) != len(grid) or len(prev[0]) != len(grid[0]):
+            return
+        if prev is not grid:
+            self._drift_samples += 1
+            if prev != grid:
+                for y, (old_row, new_row) in enumerate(zip(prev, grid)):
+                    if old_row == new_row:
+                        continue
+                    for x, (old, new) in enumerate(zip(old_row, new_row)):
+                        if old != new:
+                            self._drift_change_counts[(x, y)] += 1
+        if self._drift_samples >= self.DRIFT_MIN_SAMPLES:
+            threshold = max(1, int(math.ceil(self._drift_samples * self.drift_cell_ratio)))
+            detected = {cell for cell, n in self._drift_change_counts.items() if n >= threshold}
+            # Sticky union: once a cell is classified as ambient drift keep it for the
+            # rest of the level. Re-classifying every frame makes the set oscillate
+            # around the threshold and churns every state-hash-keyed memory.
+            if detected - self.drift_cells:
+                self.drift_cells = frozenset(self.drift_cells | detected)
+
     def analyze_grid(self, grid: tuple[tuple[int, ...], ...], rgb: Image.Image | None = None) -> SceneSnapshot:
         h, w = len(grid), len(grid[0])
         counts = Counter(v for row in grid for v in row)
         background = min(c for c, n in counts.items() if n == max(counts.values()))
         raw_components = self._components(grid, background)
         self._update_hud_model(grid, raw_components, background)
+        self._update_bar_counter_model(grid, raw_components)
+        self._update_drift_model(grid)
         volatile = self._volatile_cells(w, h)
         world_rows = [list(row) for row in grid]
         for x, y in volatile:
@@ -545,8 +603,19 @@ class Observer:
         capacity = self._counter_capacity
         ratio = max(0.0, min(1.0, counter / capacity)) if counter is not None and capacity else None
         lives = self._measure_lives(grid)
+        # Navigation hash ignores learned self-drifting animation cells so that
+        # revisit/loop/progress logic keeps working in games with ambient motion
+        # (tr87 conveyor, ar25 hazards). Objects/world_grid stay untouched.
+        if self.drift_cells:
+            nav_rows = [list(row) for row in world_grid]
+            for x, y in self.drift_cells:
+                if 0 <= x < w and 0 <= y < h:
+                    nav_rows[y][x] = background
+            nav_hash = _stable_hash(tuple(tuple(r) for r in nav_rows))
+        else:
+            nav_hash = _stable_hash(world_grid)
         scene = SceneSnapshot(
-            grid, world_grid, w, h, _stable_hash(world_grid), _stable_hash(grid), background,
+            grid, world_grid, w, h, nav_hash, _stable_hash(grid), background,
             tuple(c for c, _ in structural_colors.most_common()), comps, objects, frozenset(volatile),
             self._hud_panel_bbox, self._counter_bbox, counter, capacity, ratio, lives,
             self._template_relations(objects), "", rgb or render_grid(grid, self.image_size)
@@ -632,6 +701,52 @@ class Observer:
             slots = max(repeated, key=lambda items: (len(items), sum(c.area for c in items)))
             slots.sort(key=lambda c: (c.bbox[0], c.bbox[1]))
             self._life_slots = [(c.bbox, c.color) for c in slots[:8]]
+
+    def _update_bar_counter_model(self, grid: tuple[tuple[int, ...], ...], comps: Sequence[ComponentObservation]) -> None:
+        """V2.6: recognize a bare shrinking bar as a resource counter (sb26 energy
+        bar: full-width 1px strip at y=53 that loses one cell per energy spend).
+        _init_counter only handles fill bars nested inside a bottom-edge HUD panel,
+        so sb26's bar was invisible to the resource model: the agent spent its
+        first life learning the budget via game-over back-inference and none of the
+        low/critical-resource brakes engaged before that. A bar only qualifies
+        after it has been observed shrinking twice anchored at one end and never
+        growing, which keeps arbitrary walls/dividers (static) and moving platforms
+        (both ends shift) out. The HUD-panel counter path keeps precedence."""
+        if self._counter_bbox is not None:
+            return
+        h, w = len(grid), len(grid[0])
+        for comp in comps:
+            x0, y0, x1, y1 = comp.bbox
+            cw, ch = x1 - x0 + 1, y1 - y0 + 1
+            if ch > 2 or cw < max(8, w // 2):
+                continue
+            if comp.area < int(0.9 * cw * ch):
+                continue
+            key = (y0, y1, comp.color)
+            cand = self._bar_counter_candidates.get(key)
+            if cand is None:
+                self._bar_counter_candidates[key] = {"full_x0": x0, "full_x1": x1, "last_w": cw, "shrinks": 0, "invalid": False}
+                continue
+            if cand["invalid"]:
+                continue
+            if cw > cand["last_w"]:
+                # A refilling/pulsing bar is not a monotone budget; drop it for good.
+                cand["invalid"] = True
+                continue
+            if cw < cand["last_w"]:
+                if x0 == cand["full_x0"] or x1 == cand["full_x1"]:
+                    cand["shrinks"] += 1
+                else:
+                    cand["invalid"] = True
+                    continue
+            cand["last_w"] = cw
+            full_w = cand["full_x1"] - cand["full_x0"] + 1
+            if cand["shrinks"] >= 2 and full_w - cw >= 2:
+                self._counter_fill_color = comp.color
+                self._counter_bbox = (cand["full_x0"], y0, cand["full_x1"], y1)
+                self._counter_capacity = full_w
+                self._bar_counter_candidates = {}
+                return
 
     def _measure_counter(self, grid: tuple[tuple[int, ...], ...]) -> int | None:
         if self._counter_bbox is None or self._counter_fill_color is None:
@@ -818,6 +933,15 @@ class Observer:
     def _template_relations(objects: Sequence[ObjectObservation]) -> tuple[dict[str, Any], ...]:
         framed = [o for o in objects if o.frame_color is not None and o.inner_pattern]
         rels = []
+        # V2.3: pairing below was exact-inner-match only, so two distinct framed+
+        # inner-pattern objects that never happen to line up exactly (ls20: a large
+        # corner status frame + a small cycling glyph frame, different sizes) never
+        # got surfaced as related at all. Add a weaker "possible_selector_pair" hint
+        # for the non-exact case so the VLM can test whether one predicts/tracks the
+        # other. Guarded to a small framed-object count: this is O(n^2) and most
+        # games have very few frame_with_inner_pattern objects, but some tile/grid
+        # puzzles could have many, and this must not blow up prompt size there.
+        small_enough = len(framed) <= 6
         for i, a in enumerate(framed):
             a_rows = [r for r in a.inner_pattern.split("/") if r]
             a_bin = tuple("".join("#" if ch != "." else "." for ch in row) for row in a_rows)
@@ -826,6 +950,8 @@ class Observer:
                 b_bin = tuple("".join("#" if ch != "." else "." for ch in row) for row in b_rows)
                 if a_bin and b_bin and a_bin == b_bin:
                     rels.append({"left": a.track_id, "right": b.track_id, "same_shape_under_rotation": True, "quarter_turns_left_to_right": 0, "same_inner_colors": a.inner_pattern == b.inner_pattern, "exact_inner_match": a.inner_pattern == b.inner_pattern, "edge_vs_world": a.near_edge != b.near_edge})
+                elif small_enough:
+                    rels.append({"left": a.track_id, "right": b.track_id, "same_shape_under_rotation": False, "exact_inner_match": False, "possible_selector_pair": True, "edge_vs_world": a.near_edge != b.near_edge})
         return tuple(rels)
 
     def compare(self, before: SceneSnapshot, after: SceneSnapshot) -> TransitionReport:
@@ -990,6 +1116,9 @@ class ResourceModel:
     steady_cost_per_action: int | None = None
     refill_descriptors: list[VisualDescriptor] = field(default_factory=list)
     hazard_descriptors: list[VisualDescriptor] = field(default_factory=list)
+    hidden_action_budget_capacity: int | None = None
+    hidden_budget_observations: list[int] = field(default_factory=list)
+    hidden_budget_source: str = ""
 
 
 @dataclass
@@ -1079,6 +1208,9 @@ class GameMemoryV20:
     solved_level_summaries: list[dict[str, Any]] = field(default_factory=list)
     advisory_notes: str = ""
     vlm_calls_total: int = 0
+    # Fixed action set for the whole game, captured once from the first legal
+    # frame. Empty tuple means it was never readable -> keep legacy per-frame legal.
+    game_action_space: tuple[int, ...] = ()
 
     def as_prompt(self) -> dict[str, Any]:
         prompt = {
@@ -1098,6 +1230,7 @@ class LevelMemoryV20:
     level_index: int = 0
     levels_completed_at_start: int = 0
     attempt_index: int = 0
+    attempt_started_at_action_count: int = 0
     initial_scene: SceneSnapshot | None = None
     current_scene: SceneSnapshot | None = None
     pre_success_scene: SceneSnapshot | None = None
@@ -1118,8 +1251,8 @@ class LevelMemoryV20:
     actor_votes: Counter[str] = field(default_factory=Counter)
     actor_bbox_history: deque[tuple[int, int, int, int]] = field(default_factory=lambda: deque(maxlen=48))
     walkable_color_votes: Counter[int] = field(default_factory=Counter)
-    wall_color_votes: Counter[int] = field(default_factory=Counter)
     resource_state: dict[str, Any] = field(default_factory=dict)
+    hidden_resource_used_this_attempt: int = 0
     total_action_count: int = 0
     actions_since_vlm: int = 999
     chunk_action_count: int = 0
@@ -1130,9 +1263,10 @@ class LevelMemoryV20:
     awaiting_reset: bool = False
     bottleneck_reason: str = ""
     notes_for_next_call: str = ""
-    recent_state_hashes: deque[str] = field(default_factory=lambda: deque(maxlen=12))
+    recent_state_hashes: deque[str] = field(default_factory=lambda: deque(maxlen=24))
     recent_action_keys: deque[str] = field(default_factory=lambda: deque(maxlen=12))
     initial_vlm_done: bool = False
+    initial_vlm_attempted: bool = False
     success_reflected: bool = False
     consecutive_nonterminal_resets: int = 0
     transform_pressure: int = 0
@@ -1141,7 +1275,21 @@ class LevelMemoryV20:
     resource_crisis: bool = False
     vlm_issue_signature: str = ""
     vlm_issue_repeat_count: int = 0
+    # Window of recent issue signatures. A ping-pong between two states produces
+    # two alternating signatures; comparing only the previous one never detects it.
+    vlm_issue_recent_signatures: deque[str] = field(default_factory=lambda: deque(maxlen=6))
+    # Consecutive VLM calls that returned no usable plan: parsed-but-empty plans AND
+    # totally unparseable/INVALID responses both count (see _request_vlm_once).
+    # Reset to 0 as soon as a plan is returned. Drives temperature: at temp=0 a bad
+    # answer reproduces deterministically (observed r11l run of 9 empty plans; ls20
+    # separately produced a repeating non-JSON ramble), so we must raise temperature
+    # to sample out of it rather than lower it.
+    consecutive_empty_plans: int = 0
     transform_state_visits: Counter[str] = field(default_factory=Counter)
+    # V2.5: subset of transform_state_visits contributed by a directed action
+    # source (plan_executor/deterministic_navigation/transform_controller/...)
+    # rather than aimless fallback probing. See _UNDIRECTED_ACTION_SOURCES.
+    transform_state_directed_visits: Counter[str] = field(default_factory=Counter)
     click_noops_by_object: Counter[str] = field(default_factory=Counter)
     click_success_by_object: Counter[str] = field(default_factory=Counter)
     click_success_coords: Counter[str] = field(default_factory=Counter)
@@ -1156,6 +1304,62 @@ class LevelMemoryV20:
     rejected_vlm_plan_feedback: list[dict[str, Any]] = field(default_factory=list)
     last_loop_break_signature: str = ""
     last_loop_break_logged_at: int = -999999
+    # VLM/local shared execution contract. These masks are state-scoped and must
+    # be honored by every executor/controller path.
+    contract_forbidden_by_state: dict[str, dict[str, str]] = field(default_factory=dict)
+    fallback_guard_block_until: int = 0
+    click_fuse_block_until: int = 0
+    # State-conditioned click memory for click-sequence games.
+    successful_clicks_by_state: dict[str, Counter[str]] = field(default_factory=dict)
+    click_edges_by_state: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Progress evidence used to prevent raw transform loops.
+    action_progress_scores: dict[str, deque[float]] = field(default_factory=dict)
+    # V2.1 real-progress vs meaningless-churn separation.
+    # all_state_visits: how many turns each state_hash was observed this level (no
+    # window limit). Used to tell a genuinely new state from a cycled/decorative one.
+    all_state_visits: Counter[str] = field(default_factory=Counter)
+    # Per-click-coordinate count of "changed pixels but made no real progress"
+    # transforms, and coords fully banned once that count crosses the fuse.
+    nonprogress_transform_coords: Counter[str] = field(default_factory=Counter)
+    global_forbidden_click_coords: dict[str, str] = field(default_factory=dict)
+    # V2.2 ticker detection: objects that transform on (nearly) every transition
+    # regardless of which action ran are timer bars / ambient tickers (tn36/vc33/
+    # lf52 shrink-bars). Their per-step tick must not count as a "transform"
+    # outcome, otherwise every action looks structural and nonprogress contracts
+    # explode. Streaks reset when the object skips a transition.
+    object_transform_streaks: Counter[str] = field(default_factory=Counter)
+    object_transform_streak_actions: dict[str, set[str]] = field(default_factory=dict)
+    object_transform_streak_moves: Counter[str] = field(default_factory=Counter)
+    ticker_object_ids: set[str] = field(default_factory=set)
+    # V2.2 cross-state nonprogress accounting: forbid an action only after it
+    # produced nonprogress transforms in >=2 distinct states, not on first sight.
+    nonprogress_transform_actions: Counter[str] = field(default_factory=Counter)
+    nonprogress_transform_states: dict[str, set[str]] = field(default_factory=dict)
+    # V2.2 navigation-rejection dedupe + VLM feedback (ar25 logged 250 identical
+    # rejections per episode without ever telling the VLM).
+    nav_reject_counts: Counter[str] = field(default_factory=Counter)
+    # Consecutive transitions with counter_delta == -1. A long streak means the
+    # counter is a per-step tax (ls20): every action costs 1, so "save resources"
+    # guards are meaningless and must stand down. Sticky once confirmed.
+    counter_tick_streak: int = 0
+    counter_is_step_tax: bool = False
+    # Set when a lone VLM movement step was intentionally delegated to the local
+    # navigator this turn; _apply_vlm_result must treat the resulting empty plan as
+    # a successful handoff, not as "vlm_unusable_plan" (which would re-trigger a
+    # bottleneck VLM call every other action).
+    fuel_nav_delegated_at: int = -999
+    # V2.3: object ids that have shown persistent-id transform evidence (pattern/type
+    # changed while keeping the same track_id), e.g. ls20's O1 corner frame cycling
+    # its inner pattern. A pure bbox/position heuristic alone (_looks_like_
+    # nonplayfield_status_cue) previously mislabelled such objects as decorative HUD
+    # cues forever; this lets that heuristic stand down once real evidence exists.
+    mechanism_evidence_object_ids: set[str] = field(default_factory=set)
+    # V2.4: object ids tagged as possible_selector_pair from framed-template relations
+    # at level start (before any transform evidence). Used to pre-label mechanism
+    # candidates instead of waiting for the first measured transform on O1.
+    selector_pair_object_ids: set[str] = field(default_factory=set)
+    # Cap mechanism-hypothesis rewrites per attempt to avoid prompt churn loops.
+    hypothesis_escalation_count: int = 0
 
     def active_step(self) -> PlanStep | None:
         while self.plan_cursor < len(self.current_plan) and self.current_plan[self.plan_cursor].status in {"done", "skipped", "failed"}:
@@ -1188,8 +1392,9 @@ class LevelMemoryV20:
             "tried_here": sorted(self.tried_actions_by_state.get(state, set())),
             "outcomes_here": _json_safe(self.state_action_outcomes.get(state, {})),
             "quarantined_here": {k: v for k, v in self.quarantine_until_by_state.get(state, {}).items() if v > self.total_action_count},
-            "terrain_model": {"walkable_color_votes": dict(self.walkable_color_votes), "wall_color_votes": dict(self.wall_color_votes), "actor_motion_bbox": self.actor_motion_bbox()},
+            "terrain_model": {"walkable_color_votes": dict(self.walkable_color_votes), "actor_motion_bbox": self.actor_motion_bbox()},
             "resource_state": dict(self.resource_state),
+            "hidden_resource_state": {"used_this_attempt": self.hidden_resource_used_this_attempt},
             "actions_since_vlm": self.actions_since_vlm,
             "chunk_action_count": self.chunk_action_count,
             "vlm_calls_this_level": self.vlm_calls_this_level,
@@ -1206,6 +1411,11 @@ class LevelMemoryV20:
             "click_region_counts": dict(self.click_region_counts.most_common(12)),
             "click_success_coords": dict(self.click_success_coords.most_common(12)),
             "click_success_regions": dict(self.click_success_regions.most_common(12)),
+            "contract_forbidden_here": dict(self.contract_forbidden_by_state.get(state, {})),
+            "fallback_guard_block_until": self.fallback_guard_block_until,
+            "click_fuse_block_until": self.click_fuse_block_until,
+            "successful_clicks_here": dict(self.successful_clicks_by_state.get(state, Counter()).most_common(8)),
+            "action_progress_scores": {k: [round(float(v), 3) for v in list(vals)[-4:]] for k, vals in self.action_progress_scores.items()},
             "terminal_bad_action_suffixes": [list(s) for s in self.bad_action_suffixes[-6:]],
             "notes_for_next_call": self.notes_for_next_call[:700],
         }
@@ -1225,6 +1435,9 @@ class VLMRequest:
     previous_rgb: Image.Image | None = None
     analysis_rgb: Image.Image | None = None
     max_new_tokens: int = 1100
+    # Raised above 0 when the same issue keeps repeating, so a deterministic
+    # backend stops returning the exact same rejected plan every call.
+    temperature: float = 0.0
 
 
 class VLMBackend(Protocol):
@@ -1408,7 +1621,7 @@ class OpenAICompatibleBackend:
                 model=self.config.vlm_api_model,
                 messages=[{"role": "system", "content": V20_SYSTEM_PROMPT}, {"role": "user", "content": content}],
                 max_tokens=request.max_new_tokens,
-                temperature=0,
+                temperature=max(0.0, min(1.0, float(request.temperature or 0.0))),
                 timeout=self.config.vlm_api_timeout_s,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
             )
@@ -1436,13 +1649,29 @@ def make_vlm_backend(config: AgentConfig, logger: DecisionLogger) -> VLMBackend:
     return OpenAICompatibleBackend(config, logger) if vlm_uses_remote_api(config) else Qwen35Backend(config, logger)
 
 
+V20_ARC_ACTION_REFERENCE: dict[str, str] = {
+    "RESET": "Start or restart the game. Agent policy: do not propose unless terminal or no non-reset legal action exists.",
+    "ACTION1-ACTION5": "Simple actions (e.g., move up/down/left/right, interact). Per-game mapping is unknown until transition evidence; probe to learn.",
+    "ACTION6": "Complex action requiring (x, y) coordinates.",
+    "ACTION7": "Additional simple action. In many human-25 games this is undo/back; avoid unless positive evidence proves it advances this game.",
+}
+
+V20_LEVEL_INIT_SIMPLE_ACTION_HINT = (
+    "LEVEL_INIT: ARC official action prior — ACTION1-ACTION5 are simple actions "
+    "(e.g., move up/down/left/right, interact). Do not assume direction, interact target, "
+    "or win condition until transition evidence exists. Probe untested simple actions in "
+    "legal_actions_now before multi-step navigation."
+)
+
 V20_SYSTEM_PROMPT = """You control an abstract ARC-AGI-3 grid game.
 Use the raw image, annotated image, object table, transition evidence, action outcome memory, and resource state together.
 Object ids like O1/O2 are LOCAL to the current level. Game-level memory must not store bare O-ids; convert them to visual descriptors and roles.
+ARC action types: RESET starts/restarts; ACTION1-ACTION5 are simple actions (e.g., move up/down/left/right, interact); ACTION6 requires (x,y) coordinates; ACTION7 is an additional simple action.
 ACTION7 is often an undo/back action in public human-25 games. Do not propose ACTION7 unless recent evidence proves it advances this game; prefer another interaction/probe.
 When an action causes transforms rather than simple translation, do not keep treating it as a movement vector. Explain the transformed object and propose the next different test.
 For ACTION6 click games, give target_object_id and, when relevant, click_hint=center|edge|corner|outside-adjacent or explicit x,y.
 Respect resource counters/lives: if each noop consumes counter, use high-information actions only and stop repeating guards.
+game_action_space, when present, is the complete fixed set of actions usable for the whole game; never propose or plan actions outside it. When it is null/absent, rely on legal_actions_now instead.
 Return exactly one JSON object. No markdown or prose outside JSON. Do not propose RESET unless terminal."""
 
 
@@ -1559,8 +1788,11 @@ def _repair_truncated_json(text: str) -> dict[str, Any] | None:
             if depth > 0:
                 depth -= 1
                 last_safe = i + 1
-        elif ch == "," and depth <= 1:
-            # 只把顶层 key 之间的逗号当安全点；数组/嵌套对象内部的逗号截断会破坏元素，不采用
+        elif ch == ",":
+            # 任意深度的逗号（字符串外）都是安全截断点：逗号之前必然是完整的
+            # 数组元素或完整的 key-value 对，截断后补闭合括号即可得到合法 JSON。
+            # 典型场景：模型在 action_sequence 里退化复读 "ACTION2","ACTION2",...
+            # 直到 max_tokens 截断——旧逻辑只认顶层逗号，会把整个 plan 丢掉。
             last_safe = i
     if last_safe <= 0:
         return None
@@ -1691,6 +1923,8 @@ TRUSTED_ROUTE_REASONS = (
     "selector_calibration",
     "selector_cycle_learn",
     "selector_pattern_rule",
+    "mechanism_probe",
+    "resource_recovery",
 )
 
 
@@ -1805,7 +2039,11 @@ def parse_vlm_result(raw: Any) -> V20VLMResult | None:
 
     action_updates = [x for x in dict_list("action_meaning_updates", 16) if not _is_schema_echo_action_update(x)]
     object_effects = [x for x in dict_list("object_effect_updates", 16) if not _is_schema_echo_object_effect(x)]
-    plan_steps = [x for x in dict_list("plan", 24) if not _is_schema_echo_plan_step(x)]
+    raw_steps = dict_list("steps", 24)
+    raw_plan = dict_list("plan", 24)
+    step_candidates = [x for x in raw_steps if not _is_schema_echo_plan_step(x)]
+    plan_candidates = [x for x in raw_plan if not _is_schema_echo_plan_step(x)]
+    plan_steps = step_candidates or plan_candidates
     raw_win_update = payload.get("win_condition_update")
     if isinstance(raw_win_update, dict):
         win_update = dict(raw_win_update)
@@ -1987,12 +2225,13 @@ class MyAgent(_BaseAgent):
             self.game_id = str(getattr(getattr(self, "arc_env", None), "game_id", "unknown") or "unknown")
         self.config: AgentConfig = config or AgentConfig.from_env()
         self.MAX_ACTIONS = self.config.max_actions
-        self.observer = Observer(self.config.image_size)
+        self.observer = Observer(self.config.image_size, self.config.drift_cell_ratio)
         self.logger = DecisionLogger(self.config)
         self.backend = backend if backend is not None else make_vlm_backend(self.config, self.logger)
         self.memory = RuntimeMemoryV20()
         self._call_index = 0
         self._done = False
+        self._last_drift_cell_count = 0
 
     @property
     def name(self) -> str:
@@ -2018,6 +2257,7 @@ class MyAgent(_BaseAgent):
         state = state_name(getattr(latest_frame, "state", None))
         levels_completed = int(getattr(latest_frame, "levels_completed", 0) or 0)
         legal = normalize_legal_actions(getattr(latest_frame, "available_actions", None), self._env_action_space(), allow_env_fallback=(state == "NOT_PLAYED"))
+        legal = self._reconcile_game_action_space(legal, state)
         try:
             if self.memory.level.total_action_count >= self.MAX_ACTIONS:
                 self._flush_last_vlm_io("max_actions")
@@ -2084,6 +2324,23 @@ class MyAgent(_BaseAgent):
                 self._maybe_call_vlm(scene, transition, legal)
             selected = self._execute_next_plan_action(scene, legal)
 
+            called_vlm_this_turn = self.memory.level.vlm_calls_this_level > vlm_calls_at_turn_start
+            repeat_cooldown_active = (
+                self.memory.level.vlm_issue_repeat_count >= 2
+                and self.memory.level.actions_since_vlm < self.config.vlm_repeat_bottleneck_cooldown
+            )
+            fallback_guard_temporarily_blocked = (
+                self.memory.level.fallback_guard_block_until > self.memory.level.total_action_count
+                and self._vlm_available()
+                and self.memory.level.vlm_calls_this_level < self.config.max_vlm_calls_per_level
+            )
+            if selected is None and fallback_guard_temporarily_blocked and not called_vlm_this_turn and not repeat_cooldown_active:
+                self.memory.level.bottleneck_reason = self.memory.level.bottleneck_reason or "vlm_zero_step_needs_recovery_contract"
+                self._request_vlm_once(scene, transition, legal, VLMMode.BOTTLENECK)
+                selected = self._execute_next_plan_action(scene, legal)
+
+            if selected is None:
+                selected = self._confirm_probe_action(scene, legal)
             if selected is None and self._in_transform_mode(scene):
                 selected = self._transform_controller_action(scene, legal)
             if selected is None:
@@ -2118,15 +2375,27 @@ class MyAgent(_BaseAgent):
             if selected is None:
                 selected = self._frontier_probe_action(scene, legal)
             if selected is None:
-                allow_guard = (self.memory.level.vlm_calls_this_level > vlm_calls_at_turn_start) or not self._vlm_available() or self.memory.level.vlm_calls_this_level >= self.config.max_vlm_calls_per_level
+                fallback_guard_temporarily_blocked = (
+                    self.memory.level.fallback_guard_block_until > self.memory.level.total_action_count
+                    and self._vlm_available()
+                    and self.memory.level.vlm_calls_this_level < self.config.max_vlm_calls_per_level
+                )
+                allow_guard = (
+                    not fallback_guard_temporarily_blocked
+                    and (
+                        self.memory.level.vlm_calls_this_level > vlm_calls_at_turn_start
+                        or not self._vlm_available()
+                        or self.memory.level.vlm_calls_this_level >= self.config.max_vlm_calls_per_level
+                    )
+                )
                 selected = self._fallback_nonreset_action(scene, legal, "safe non-reset fallback after outcome-aware planner exhaustion", allow_guard=allow_guard)
-            if selected is None and state not in {"WIN", "GAME_OVER", "NOT_PLAYED"}:
-                selected = self._force_nonreset_action(scene, legal)
             if selected is None:
                 if state not in {"WIN", "GAME_OVER", "NOT_PLAYED"} and not self.config.nonterminal_reset_allowed:
                     selected = self._least_bad_nonreset_action(scene, legal)
                     if selected is None:
                         selected = self._absolute_nonreset_action(scene, legal, "final non-reset fallback after all guards exhausted")
+                if selected is None and state not in {"WIN", "GAME_OVER", "NOT_PLAYED"} and not self.config.nonterminal_reset_allowed:
+                    selected = self._evidence_exhausted_nonreset_action(scene, legal, "active-state sentinel after all non-reset guards were blocked")
                 if selected is None:
                     return self._reset_action(reason="no_nonreset_legal", state=state, scene=scene, legal=legal)
 
@@ -2139,6 +2408,70 @@ class MyAgent(_BaseAgent):
 
     def _env_action_space(self) -> Iterable[Any] | None:
         return getattr(getattr(self, "arc_env", None), "action_space", None)
+
+    def _game_space_actions(self) -> tuple[Any, ...]:
+        """Materialize the captured game-level action space as action objects."""
+        out: list[Any] = []
+        for value in self.memory.game.game_action_space:
+            action = normalize_one_action(int(value))
+            if action is not None:
+                out.append(action)
+        return tuple(out)
+
+    def _reconcile_game_action_space(self, legal: Sequence[Any], state: str) -> tuple[Any, ...]:
+        """Capture the whole-game action space once, then constrain exploration to it.
+
+        - First readable non-reset legal set is frozen as the game action space.
+        - Once frozen, every later frame's legal is intersected with it (RESET kept),
+          so all downstream exploration only considers these actions.
+        - If a frame yields no in-space action (empty/corrupt frame), fall back to the
+          frozen space so the agent still has candidates.
+        - If it was never readable, return legal unchanged (legacy behaviour).
+        """
+        legal = tuple(legal)
+        game = self.memory.game
+        frame_values = tuple(sorted({action_value(a) for a in legal if action_value(a) >= 1}))
+        if not game.game_action_space:
+            if frame_values:
+                game.game_action_space = frame_values
+                self.logger.log_event("game_action_space_captured_v20", {"action_space": [f"ACTION{v}" for v in frame_values], "state": state, "level": self.memory.level.level_index})
+        else:
+            # 离线引擎的 available_actions 整局恒定，这里永不触发；防御的是远程 API
+            # 按状态扩充动作集的情形——新动作并入而不是被交集永久丢弃。
+            unseen = [v for v in frame_values if v not in game.game_action_space]
+            if unseen:
+                game.game_action_space = tuple(sorted(set(game.game_action_space) | set(unseen)))
+                self.logger.log_event("game_action_space_expanded_v20", {"added": [f"ACTION{v}" for v in unseen], "action_space": [f"ACTION{v}" for v in game.game_action_space], "state": state, "level": self.memory.level.level_index})
+        if not game.game_action_space:
+            return legal
+        space = set(game.game_action_space)
+        constrained = tuple(a for a in legal if action_value(a) in space or action_value(a) == 0)
+        if constrained:
+            return constrained
+        return self._game_space_actions()
+
+    def _action7_probe_allowed(self) -> bool:
+        """Opening knowledge from the declared whole-game action space: when the
+        space is small (<=3 non-click actions) and explicitly includes ACTION7,
+        the designer chose it as part of a tiny vocabulary, so it is likely a core
+        mechanic rather than undo (sb26 space is 5/6/7, su15 is 6/7). Grant a
+        bounded number of real probes before the global ACTION7 avoidance applies.
+
+        Disabled by default (config.action7_space_probe): current stage treats
+        ACTION7 strictly as undo and prioritizes completion first."""
+        if not self.config.action7_space_probe:
+            return False
+        space = self.memory.game.game_action_space
+        if not space or 7 not in space:
+            return False
+        if len([v for v in space if v != 6]) > 3:
+            return False
+        meaning = self.memory.game.action_meanings.get("ACTION7")
+        if meaning is None:
+            return True
+        if meaning.retries or meaning.life_losses or meaning.kind == "undo":
+            return False
+        return meaning.attempts < 2
 
     def _game_id(self) -> str:
         return str(getattr(self, "game_id", "unknown"))
@@ -2156,8 +2489,9 @@ class MyAgent(_BaseAgent):
             current_scene=scene,
             resource_state=self._resource_state_from_scene(scene),
         )
-        self.memory.level.recent_state_hashes.append(scene.state_hash)
+        self._append_recent_state_hash(scene.state_hash)
         self._update_resource_model_from_scene(scene)
+        self._seed_selector_pair_hints(scene)
         self._seed_initial_plan(scene, legal)
         self.logger.log_event("new_level_v20", {"level": levels_completed, "state": scene.state_hash[:12], "objects": [o.track_id for o in scene.objects], "counter": scene.counter_value, "lives": scene.life_count})
 
@@ -2170,8 +2504,14 @@ class MyAgent(_BaseAgent):
             level_index=old.level_index,
             levels_completed_at_start=levels_completed,
             attempt_index=attempt_index,
+            attempt_started_at_action_count=total_actions,
             initial_scene=scene,
             current_scene=scene,
+            # Floor colour is a property of the level's rendering, not of any tracked
+            # object id, so (unlike actor/ticker evidence, which is keyed by track_id
+            # and reset_level() reassigns ids from scratch) it stays valid across a
+            # same-level reset and is safe to carry over.
+            walkable_color_votes=old.walkable_color_votes,
             recent_events=old.recent_events,
             known_noops_by_state=old.known_noops_by_state,
             tried_actions_by_state=old.tried_actions_by_state,
@@ -2189,47 +2529,147 @@ class MyAgent(_BaseAgent):
             click_coord_counts=old.click_coord_counts,
             click_region_counts=old.click_region_counts,
             bad_action_suffixes=list(old.bad_action_suffixes),
+            contract_forbidden_by_state=old.contract_forbidden_by_state,
+            fallback_guard_block_until=old.fallback_guard_block_until,
+            click_fuse_block_until=old.click_fuse_block_until,
+            successful_clicks_by_state=old.successful_clicks_by_state,
+            click_edges_by_state=old.click_edges_by_state,
+            action_progress_scores=old.action_progress_scores,
+            global_forbidden_click_coords=old.global_forbidden_click_coords,
+            nonprogress_transform_coords=old.nonprogress_transform_coords,
+            nonprogress_transform_actions=old.nonprogress_transform_actions,
+            nonprogress_transform_states=old.nonprogress_transform_states,
+            counter_is_step_tax=old.counter_is_step_tax,
+            # V2.4: a game-over reset is the SAME level/puzzle with fresh object ids,
+            # not a new mechanism. ls20 regression: this reset to 0 previously, so
+            # attempt 2's LEVEL_INIT immediately re-issued a banned geometry route
+            # because the "locked" check looked like a fresh, un-escalated level.
+            hypothesis_escalation_count=old.hypothesis_escalation_count,
         )
         level = self.memory.level
-        level.recent_state_hashes.append(scene.state_hash)
+        self._append_recent_state_hash(scene.state_hash)
         level.bottleneck_reason = "new_attempt_after_game_over"
         self._update_resource_model_from_scene(scene)
+        self._seed_selector_pair_hints(scene)
+        if self._mechanism_hypothesis_locked():
+            # Re-bind status_template_frame/selector_frame to this attempt's fresh
+            # O-ids without incrementing the escalation counter or re-clearing plan
+            # state; the hypothesis itself (game.win_condition) already persists.
+            self._bind_selector_pair_roles(scene)
         self._seed_initial_plan(scene, legal)
         self.logger.log_event("new_attempt_v20", {"level": level.level_index, "attempt": attempt_index, "state": scene.state_hash[:12], "total_actions": total_actions, "known_noops_preserved": sum(len(v) for v in level.known_noops_by_state.values()), "click_coord_counts": dict(level.click_coord_counts.most_common(8))})
 
     def _remember_current_state(self, scene: SceneSnapshot) -> None:
         level = self.memory.level
         level.current_scene = scene
-        if not level.recent_state_hashes or level.recent_state_hashes[-1] != scene.state_hash:
-            level.recent_state_hashes.append(scene.state_hash)
+        self._append_recent_state_hash(scene.state_hash)
         level.resource_state = self._resource_state_from_scene(scene)
+        drift_count = len(self.observer.drift_cells)
+        if drift_count != self._last_drift_cell_count:
+            self.logger.log_event("auto_drift_cells_v20", {"level": level.level_index, "cells": drift_count, "previous": self._last_drift_cell_count, "sample": sorted(self.observer.drift_cells)[:12]})
+            self._last_drift_cell_count = drift_count
 
-    def _maybe_break_loop(self, scene: SceneSnapshot) -> None:
+    def _append_recent_state_hash(self, state_hash: str) -> None:
+        level = self.memory.level
+        if level.recent_state_hashes and level.recent_state_hashes[-1] == state_hash:
+            return
+        level.recent_state_hashes.append(state_hash)
+        level.all_state_visits[state_hash] += 1
+
+    def _productive_motion_event(self, event: CompactEvent) -> bool:
+        if event.outcome in {"noop", "retry"}:
+            return False
+        try:
+            progress = float(event.transition_delta.get("progress_score", 1.0))
+        except Exception:
+            progress = 1.0
+        if progress <= 0.25:
+            return False
+        if event.outcome in {"movement", "movement_with_transform", "interaction", "level_advanced"}:
+            return True
+        delta = event.transition_delta if isinstance(event.transition_delta, dict) else {}
+        if event.outcome == "transform":
+            # A transform is only "productive" if it did not just bounce us back into a
+            # state we keep revisiting. ft09-style decorative flicker cycles among a few
+            # already-seen states with no real progress and must NOT count as a route.
+            if self.memory.level.all_state_visits.get(event.after_state, 0) >= self.config.churn_state_visit_cap:
+                return False
+            if (
+                delta.get("moved_objects")
+                or delta.get("appeared")
+                or delta.get("disappeared")
+                or delta.get("transformed_objects")
+            ):
+                return True
+        return False
+
+    def _recent_productive_route(self, *, min_len: int = 3) -> bool:
+        recent = list(self.memory.level.recent_events)[-min_len:]
+        return len(recent) >= min_len and all(self._productive_motion_event(event) for event in recent)
+
+    def _unproductive_state_loop_signal(self, scene: SceneSnapshot) -> tuple[bool, int, str]:
         level = self.memory.level
         hashes = list(level.recent_state_hashes)
         if len(hashes) < 6:
-            return
+            return False, 0, ""
+        recent_events = list(level.recent_events)[-8:]
+        if len(recent_events) < 4:
+            return False, 0, ""
+        if self._recent_productive_route(min_len=3):
+            return False, 0, ""
+        if recent_events and self._productive_motion_event(recent_events[-1]):
+            return False, 0, ""
         state_visits = Counter(hashes)
         max_visits = max(state_visits.values()) if state_visits else 0
         if max_visits < 3:
+            return False, 0, ""
+        current_visits = state_visits.get(scene.state_hash, 0)
+        if current_visits < 2:
+            return False, 0, ""
+        # Count both hard no-ops/retries and "changed pixels but no real progress"
+        # transforms as unproductive, so decorative churn loops (ft09/tr87) are caught.
+        unproductive = sum(1 for event in recent_events if not self._productive_motion_event(event))
+        if unproductive < max(3, int(len(recent_events) * 0.55)):
+            return False, 0, ""
+        unique_recent_states = len(set(hashes[-6:]))
+        if unique_recent_states <= 2 and current_visits >= 2:
+            return True, max_visits, "state_ping_pong_without_progress"
+        if current_visits >= 3 and unproductive >= len(recent_events) - 1:
+            return True, max_visits, "state_loop_without_erasing_noops"
+        return False, 0, ""
+
+    def _maybe_break_loop(self, scene: SceneSnapshot) -> None:
+        level = self.memory.level
+        loop_active, max_visits, loop_reason = self._unproductive_state_loop_signal(scene)
+        if not loop_active:
             return
         # V1.9 cleared known_noops here. V2.0 keeps evidence and quarantines recent no-op actions instead.
+        q_before = dict(level.quarantine_until_by_state.get(scene.state_hash, {}))
         q = level.quarantine_until_by_state.setdefault(scene.state_hash, {})
         for key in list(level.known_noops_by_state.get(scene.state_hash, set()))[-8:]:
             q[key] = max(q.get(key, 0), level.total_action_count + self.config.quarantine_steps)
-        if level.recent_action_keys:
+        if level.recent_action_keys and level.recent_events:
             key = level.recent_action_keys[-1]
-            # ACTION6 is coordinate-valued. A state loop after a few bad clicks should
-            # not quarantine the whole click space; per-coordinate noop memory and
-            # click count limits already block exact repeats.
-            if not key.startswith("ACTION6:"):
+            last_event = level.recent_events[-1]
+            # Only quarantine the last action when it actually failed here. Revisiting a
+            # state via productive movement/navigation is normal and must not block it.
+            if last_event.outcome in {"noop", "retry"} and not key.startswith("ACTION6:"):
                 q[key] = max(q.get(key, 0), level.total_action_count + max(2, self.config.action_repeat_cooldown))
-        level.bottleneck_reason = level.bottleneck_reason or "state_loop_without_erasing_noops"
-        signature = f"{scene.state_hash}:{max_visits}:{','.join(sorted(q))}"
+        if q == q_before and not q:
+            return
+        level.bottleneck_reason = level.bottleneck_reason or loop_reason
+        # tr87-style: when the loop is dominated by transforms, tell the VLM to check
+        # whether a selector/actor pattern already matches the target and, if so, stop
+        # cycling and commit instead of transforming forever.
+        if not level.notes_for_next_call:
+            recent_tr = sum(1 for e in list(level.recent_events)[-8:] if e.outcome in {"transform", "movement_with_transform"})
+            if recent_tr >= 4:
+                level.notes_for_next_call = "Repeated transforms are cycling among a few states without progress. If a selector/actor pattern already matches its target, STOP transforming and commit/confirm; otherwise switch to a different action or target."
+        signature = f"{scene.state_hash}:{max_visits}:{loop_reason}:{','.join(sorted(q))}"
         if signature != level.last_loop_break_signature or level.total_action_count - level.last_loop_break_logged_at >= self.config.quarantine_steps:
             level.last_loop_break_signature = signature
             level.last_loop_break_logged_at = level.total_action_count
-            self.logger.log_event("loop_break_v20", {"state": scene.state_hash[:12], "max_state_visits": max_visits, "known_noops_kept": sorted(level.known_noops_by_state.get(scene.state_hash, set())), "quarantined": q})
+            self.logger.log_event("loop_break_v20", {"state": scene.state_hash[:12], "max_state_visits": max_visits, "reason": loop_reason, "known_noops_kept": sorted(level.known_noops_by_state.get(scene.state_hash, set())), "quarantined": q})
 
     def _process_pending_transition(self, current_scene: SceneSnapshot, latest_frame: Any, *, cross_level: bool = False) -> TransitionReport | None:
         pending = self.memory.level.pending_action
@@ -2242,10 +2682,94 @@ class MyAgent(_BaseAgent):
         report.annotated_rgb = current_scene.annotated_rgb
         report.action_key = pending.action_key()
         report.action_source = pending.source
+        if not cross_level:
+            self._filter_ticker_transforms(pending, report)
         self.memory.level.last_resolved_pending_action = pending
         self.memory.level.pending_action = None
         self._record_transition(pending, report, current_scene, cross_level=cross_level)
         return report
+
+    TICKER_STREAK_THRESHOLD = 6
+    TICKER_MIN_DISTINCT_ACTIONS = 3
+
+    def _filter_ticker_transforms(self, pending: PendingAction, report: TransitionReport) -> None:
+        """Detect timer-bar/ambient-ticker objects and strip them from the transform view.
+
+        tn36/vc33/lf52/s5i5 have a bar that ticks on every transition regardless of the
+        action, so every step classified as "transform" with progress<=0 and the
+        nonprogress contract/bottleneck machinery fired on literally every action. An
+        object is a ticker once it transformed on TICKER_STREAK_THRESHOLD consecutive
+        transitions under at least TICKER_MIN_DISTINCT_ACTIONS different action keys
+        (the action diversity requirement keeps a puzzle piece hammered by one repeated
+        action from being misclassified)."""
+        level = self.memory.level
+        transformed_ids = {str(t.get("object_id") or "") for t in report.transformed_objects}
+        transformed_ids.discard("")
+        moved_ids = {str(m.get("object_id") or "") for m in report.moved_objects}
+        for oid in list(level.object_transform_streaks):
+            if oid not in transformed_ids:
+                level.object_transform_streaks.pop(oid, None)
+                level.object_transform_streak_actions.pop(oid, None)
+                level.object_transform_streak_moves.pop(oid, None)
+        action_key = pending.action_key()
+        for oid in transformed_ids:
+            level.object_transform_streaks[oid] += 1
+            actions_seen = level.object_transform_streak_actions.setdefault(oid, set())
+            actions_seen.add(action_key)
+            if oid in moved_ids:
+                level.object_transform_streak_moves[oid] += 1
+            streak = level.object_transform_streaks[oid]
+            moves = level.object_transform_streak_moves.get(oid, 0)
+            # A real ticker changes without being carried around. sp80's coupled frames
+            # O4/O6 transform AND translate on ~97% of steps (they are the actor pair),
+            # while vc33/tn36/lf52 timer bars transform every step but translate on only
+            # ~0-30% (a shrinking bar drifts its centroid occasionally). Displacement
+            # magnitude does not separate them (both move ~1 cell), but move RATE does:
+            # require the streak to be dominated by non-moving transforms so controlled/
+            # coupled movers are never mislabeled tickers, without weakening bar detection.
+            if (
+                oid not in level.ticker_object_ids
+                and oid != level.controlled_object_id
+                and streak >= self.TICKER_STREAK_THRESHOLD
+                and len(actions_seen) >= self.TICKER_MIN_DISTINCT_ACTIONS
+                and moves * 2 <= streak
+            ):
+                level.ticker_object_ids.add(oid)
+                self.logger.log_event(
+                    "ticker_object_detected_v20",
+                    {"level": level.level_index, "object": oid, "streak": level.object_transform_streaks[oid], "distinct_actions": len(actions_seen)},
+                )
+                level.notes_for_next_call = _short(
+                    f"Object {oid} changes on EVERY step regardless of the action (timer/ticker). Ignore its changes when judging action effects; do not treat its tick as progress or as a transform mechanic. "
+                    + (level.notes_for_next_call or ""),
+                    700,
+                )
+        if not level.ticker_object_ids:
+            return
+        kept = [t for t in report.transformed_objects if str(t.get("object_id") or "") not in level.ticker_object_ids]
+        if len(kept) == len(report.transformed_objects):
+            return
+        report.transformed_objects = kept
+        structural_left = bool(kept or report.appeared_object_ids or report.disappeared_object_ids)
+        # Re-derive interaction_event with the ticker removed (compare() had set it
+        # from the unfiltered transform list).
+        if report.interaction_event and not (
+            report.retry_detected
+            or (report.counter_delta is not None and report.counter_delta > 1)
+            or report.life_delta not in (None, 0)
+            or structural_left
+        ):
+            report.interaction_event = False
+        # If nothing but the ticker changed, the action was effectively a no-op.
+        if (
+            not structural_left
+            and not report.moved_objects
+            and (report.counter_delta is None or report.counter_delta <= 0)
+            and report.life_delta in (None, 0)
+            and not report.retry_detected
+        ):
+            report.effective_noop = True
+            report.summary = report.summary + "; ticker_only=true"
 
     def _transition_delta_dict(self, report: TransitionReport) -> dict[str, Any]:
         return {
@@ -2283,31 +2807,93 @@ class MyAgent(_BaseAgent):
                     return move
         return None
 
+    def _minor_structural_churn(self, report: TransitionReport, visits_before: int | None = None) -> bool:
+        if not report.transformed_objects:
+            return False
+        if report.appeared_object_ids or report.disappeared_object_ids:
+            return False
+        if report.is_simple_translation or self._controlled_motion(report) is not None:
+            return False
+        if visits_before == 0:
+            # V2.6: sb26 regression - a small pixel footprint alone is not evidence of
+            # decorative churn when the resulting state has never been seen before this
+            # level (e.g. a selector bar that shrinks by exactly one cell per press:
+            # world_changed_cell_count==1 every time, but each press lands on a
+            # genuinely new state, not a repeating flicker). Only treat a small
+            # transform as churn once it actually revisits an already-seen state;
+            # callers that cannot determine novelty keep passing None, which preserves
+            # the old always-penalize behavior.
+            return False
+        return report.world_changed_cell_count <= 2
+
+    @staticmethod
+    def _predicates_expect_structural_change(predicates: Sequence[dict[str, Any]] | None) -> bool:
+        """True only if the step itself declared it expected a transform/appear/
+        disappear. Steps that only ask for not_noop/no_retry/no_life_loss/
+        controlled_motion are a pure-movement bet: controlled_motion is satisfied by
+        transform-coupled motion too (an actor merging into a container still has
+        dx/dy != 0), so those steps must NOT be treated as having anticipated a
+        structural change just because they also pass."""
+        for pred in predicates or ():
+            if not isinstance(pred, dict):
+                continue
+            kind = _short(pred.get("type") or pred.get("predicate"), 80).lower()
+            if kind in {"structural_change", "appeared_or_disappeared"}:
+                return True
+        return False
+
     def _classify_outcome(self, report: TransitionReport) -> str:
         if report.retry_detected:
             return "retry"
         if report.effective_noop:
             return "noop"
+        move = self._controlled_motion(report)
+        structural = bool(
+            report.transformed_objects
+            or report.appeared_object_ids
+            or report.disappeared_object_ids
+        )
         if report.appeared_object_ids or report.disappeared_object_ids:
             return "transform"
-        if self._controlled_motion(report) is not None:
+        if move is not None:
             return "movement"
         if report.is_simple_translation or (report.controlled_candidate_id and report.moved_objects):
             return "movement"
-        if report.transformed_objects:
+        if structural:
             return "transform"
-        if report.interaction_event and not report.is_simple_translation:
-            return "transform"
-        if report.counter_delta is not None or report.life_delta is not None:
-            return "resource_delta"
         if report.interaction_event:
             return "interaction"
+        if report.counter_delta is not None or report.life_delta is not None:
+            return "resource_delta"
         return "state_change"
 
     def _record_transition(self, pending: PendingAction, report: TransitionReport, current_scene: SceneSnapshot, *, cross_level: bool = False) -> None:
         level = self.memory.level
         before_state, after_state, action_key = pending.scene_before.state_hash, current_scene.state_hash, pending.action_key()
         outcome = "level_advanced" if cross_level else self._classify_outcome(report)
+        progress_score = 1.0 if cross_level else self._transition_progress_score(pending, report, current_scene)
+        if not cross_level and self._hidden_resource_transition_consumed(pending, report, outcome, current_scene):
+            level.hidden_resource_used_this_attempt += 1
+        if report.counter_delta == -1:
+            level.counter_tick_streak += 1
+            if level.counter_tick_streak >= 10 and not level.counter_is_step_tax:
+                # ls20-style: the counter is a per-step tax every action pays. There is
+                # no "saving" it; resource guards must stop vetoing ordinary actions.
+                level.counter_is_step_tax = True
+                # Purge resource_guard bans accumulated before detection (all written
+                # from bankruptcy-poisoned evidence); they persist forever otherwise
+                # because crisis rarely clears in a step-tax game.
+                purged = 0
+                for rules in level.contract_forbidden_by_state.values():
+                    for rk in [k for k, v in rules.items() if str(v).startswith("resource_guard:")]:
+                        del rules[rk]
+                        purged += 1
+                self.logger.log_event("counter_step_tax_detected_v20", {"level": level.level_index, "streak": level.counter_tick_streak, "counter": report.counter_ratio_after, "resource_guard_rules_purged": purged})
+        elif report.counter_delta is not None and report.counter_delta <= 0:
+            # A refill (>0) is the bankruptcy tick, not a break in the per-step tax.
+            # Only a genuine non-decrement resets the streak, so the +42 refills in
+            # ls20 no longer prevent/reset detection.
+            level.counter_tick_streak = 0
         if not cross_level:
             level.tried_actions_by_state.setdefault(before_state, set()).add(action_key)
             level.state_action_outcomes.setdefault(before_state, {}).setdefault(action_key, Counter())[outcome] += 1
@@ -2320,29 +2906,62 @@ class MyAgent(_BaseAgent):
             self._update_action_meaning_from_transition(pending, report, current_scene)
             self._update_actor_and_terrain(pending, report, current_scene)
             self._update_plan_after_transition(pending, report, current_scene)
-            self._update_click_memory(pending, report)
+            self._update_click_memory(pending, report, current_scene)
+            if pending.name != "RESET":
+                level.action_progress_scores.setdefault(pending.name, deque(maxlen=8)).append(progress_score)
 
-        event = CompactEvent(self.memory.next_event_id, level.level_index, level.total_action_count, action_key, pending.source, before_state, after_state, outcome, ("level_advanced_by=" + action_key) if cross_level else report.summary[:700], self._transition_delta_dict(report))
+        if not cross_level:
+            self._advance_chain_target_bindings(pending, report, current_scene)
+
+        delta = self._transition_delta_dict(report)
+        delta["progress_score"] = round(progress_score, 3)
+        if level.hidden_resource_used_this_attempt:
+            delta["hidden_resource_used_this_attempt"] = level.hidden_resource_used_this_attempt
+        event = CompactEvent(self.memory.next_event_id, level.level_index, level.total_action_count, action_key, pending.source, before_state, after_state, outcome, ("level_advanced_by=" + action_key) if cross_level else report.summary[:700], delta)
         self.memory.next_event_id += 1
         level.recent_events.append(event)
         level.recent_action_keys.append(action_key)
-        level.recent_state_hashes.append(after_state)
+        self._append_recent_state_hash(after_state)
 
         self._enforce_transition_evidence_contract(pending, report, current_scene, outcome)
 
+        if report.transformed_objects:
+            level.mechanism_evidence_object_ids.update(str(t.get("object_id") or "") for t in report.transformed_objects if t.get("object_id"))
         if outcome == "transform":
             level.transform_pressure += 1
             level.transform_state_visits[after_state] += 1
+            if pending.source not in self._UNDIRECTED_ACTION_SOURCES:
+                level.transform_state_directed_visits[after_state] += 1
             level.repeated_transform_streak = level.repeated_transform_streak + 1 if level.recent_action_keys and (len(level.recent_action_keys) < 2 or level.recent_action_keys[-2] == action_key) else 1
             if level.transform_state_visits[after_state] >= 3:
                 level.bottleneck_reason = "transform_state_cycle"
                 level.current_plan = []
                 level.plan_cursor = 0
-            elif pending.source in {"deterministic_navigation", "transform_controller"}:
+                # V2.5: ls20 regression - with the VLM stuck returning empty plans,
+                # least_bad_nonreset/frontier_probe fallback wandering alone bounced
+                # the actor back into the same merged-with-frame state 3x and
+                # permanently escalated the mechanism hypothesis (see
+                # _mechanism_hypothesis_locked, which never releases for the rest of
+                # the level/attempts) even though nothing had actually probed a real
+                # selector mechanism. Only escalate when at least one of the
+                # repeated visits came from a directed plan/controller action.
+                if level.transform_state_directed_visits.get(after_state, 0) > 0:
+                    self._maybe_escalate_mechanism_hypothesis(current_scene, "transform_state_cycle")
+            elif pending.source in {"deterministic_navigation", "transform_controller"} or (
+                pending.source == "plan_executor" and not self._predicates_expect_structural_change(pending.expected_predicates)
+            ):
+                # V2.3: a plan_executor step from a long geometry action_sequence
+                # (ls20: "move up 40 units") only declares a pure-movement
+                # expectation (not_noop/no_retry/no_life_loss/controlled_motion) yet
+                # still landed on a transform (actor merge, status-frame cycle, ...).
+                # _update_plan_after_transition already marked it matched/done on
+                # that predicate set alone, so without this the executor keeps
+                # dispatching the rest of the stale route blind to the mechanism
+                # change. Drop it and force a fresh bottleneck-driven VLM look.
                 level.current_plan = []
                 level.plan_cursor = 0
                 level.bottleneck_reason = "transform_after_" + action_key
-        elif outcome in {"movement", "interaction", "state_change", "level_advanced"}:
+        elif outcome in {"movement", "movement_with_transform", "interaction", "state_change", "level_advanced"}:
             level.repeated_transform_streak = 0
         if outcome == "noop":
             level.repeated_noop_streak += 1
@@ -2354,26 +2973,137 @@ class MyAgent(_BaseAgent):
             level.plan_cursor = 0
         if (report.interaction_event or report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids) and not (report.controlled_candidate_id and report.moved_objects):
             level.chunk_action_count = self.config.max_chunk_steps
+        if (
+            pending.source in {"plan_executor", "frontier_probe", "deterministic_click", "transform_controller", "deterministic_navigation", "nonreset_guard", "safe_probe_fallback", "absolute_nonreset", "escape_nonreset"}
+            and (report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids or report.interaction_event)
+            and progress_score <= 0.0
+        ):
+            # V2.2: forbid only after the same action produced nonprogress transforms
+            # in >=2 distinct states. A single low-score transform is normal
+            # exploration noise; first-sight bans exploded to ~1400/run and their only
+            # surviving effect (state hashes drift every step) was a bottleneck storm.
+            level.nonprogress_transform_actions[action_key] += 1
+            level.nonprogress_transform_states.setdefault(action_key, set()).add(before_state)
+            if level.nonprogress_transform_actions[action_key] >= 2 and len(level.nonprogress_transform_states[action_key]) >= 2:
+                self._contract_forbid_action(
+                    pending.scene_before,
+                    pending.action_key(),
+                    f"nonprogress_transform:{pending.source}:{progress_score:.2f}",
+                )
+                level.bottleneck_reason = level.bottleneck_reason or "nonprogress_transform_action"
+        elif progress_score > 0.5 and level.nonprogress_transform_actions.get(action_key, 0):
+            # Real progress rehabilitates the action (sp80's winning ACTION5 had been
+            # nonprogress-banned twice before it advanced the level).
+            level.nonprogress_transform_actions.pop(action_key, None)
+            level.nonprogress_transform_states.pop(action_key, None)
+        # V2.1 coordinate-level global fuse. A click that only churns decorative/cycling
+        # pixels (ft09 38,38) keeps yielding "transform" with no real progress while the
+        # state_hash drifts, so the state-scoped contract above never catches it. Track
+        # such clicks per coordinate (survives state drift) and ban them outright.
+        churn_transform = (
+            outcome == "transform"
+            and progress_score <= 0.0
+            and not (report.controlled_candidate_id and report.moved_objects)
+            and (report.counter_delta is None or report.counter_delta <= 0)
+            and report.life_delta in (None, 0)
+        )
+        if churn_transform and action_key.startswith("ACTION6:") and action_key not in level.global_forbidden_click_coords:
+            level.nonprogress_transform_coords[action_key] += 1
+            if level.nonprogress_transform_coords[action_key] >= self.config.churn_click_fuse_after:
+                level.global_forbidden_click_coords[action_key] = f"churn_transform_x{level.nonprogress_transform_coords[action_key]}"
+                level.current_plan = []
+                level.plan_cursor = 0
+                level.bottleneck_reason = level.bottleneck_reason or "click_churn_fuse"
+                level.notes_for_next_call = "A click coordinate only produced decorative/cycling pixel changes with no real progress and is now permanently banned this level. Re-check the true win condition and try a different mechanism, object, or coordinate."
+                self.logger.log_event("click_churn_fuse_v20", {"level": level.level_index, "action": action_key, "count": level.nonprogress_transform_coords[action_key], "state": current_scene.state_hash[:12]})
         self.logger.log_event("transition_v20", event.as_prompt())
+
+    def _advance_chain_target_bindings(self, pending: PendingAction, report: TransitionReport, current_scene: SceneSnapshot) -> None:
+        """Advance target role bindings along chain levels (ls20: reaching glyph N
+        consumes it and spawns glyph N+1). Previously the stale binding pointed at a
+        vanished object, _navigation_target_id fell back to interest-scored junk
+        (door frame / HUD, 38 wasted nav steps), and the target only refreshed after
+        another VLM round-trip."""
+        level = self.memory.level
+        if not report.disappeared_object_ids:
+            return
+        disappeared = set(report.disappeared_object_ids)
+        for role in ("target", "goal", "target_frame", "exit"):
+            oid = level.local_bindings.get(role, "")
+            if not oid or oid not in disappeared:
+                continue
+            old_obj = pending.scene_before.object_by_id(oid)
+            replacement = ""
+            candidates = [current_scene.object_by_id(a) for a in report.appeared_object_ids]
+            candidates = [c for c in candidates if c is not None and c.track_id != level.controlled_object_id]
+            if candidates:
+                if old_obj is not None:
+                    same_kind = [c for c in candidates if c.type_key == old_obj.type_key or c.shape_label == old_obj.shape_label]
+                    pick = same_kind[0] if same_kind else candidates[0]
+                else:
+                    pick = candidates[0]
+                replacement = pick.track_id
+            if replacement:
+                level.local_bindings[role] = replacement
+                self.logger.log_event("target_chain_advanced_v20", {"level": level.level_index, "role": role, "old": oid, "new": replacement})
+            else:
+                level.local_bindings.pop(role, None)
+                self.logger.log_event("target_chain_binding_cleared_v20", {"level": level.level_index, "role": role, "old": oid})
+
+    def _actor_merged_into_container(self, pending: PendingAction, current_actor: str, *, new_candidate: ObjectObservation | None = None) -> bool:
+        old_obj = pending.scene_before.object_by_id(current_actor)
+        if old_obj is None:
+            return False
+        if old_obj.frame_color is not None:
+            # V2.5: ls20 regression - once a first merge already rebound
+            # controlled_object_id to the container frame itself, that frame's own
+            # inner-pattern churn makes it look "disappeared" again on almost every
+            # following step even though the actor never left it. Previously only
+            # the very first merge was preserved and every step after that
+            # cascaded into actor_disappeared/clear_all, racing through new object
+            # ids (e.g. O2->O5->O8->...) for the rest of the level. As long as the
+            # newly tracked candidate is itself another framed object near the
+            # same spot, treat this as sustained containment instead.
+            if new_candidate is not None and new_candidate.frame_color is not None:
+                return self._bbox_intersects_with_margin(old_obj.bbox, new_candidate.bbox, 3)
+            return False
+        for cand in pending.scene_before.objects:
+            if cand.track_id == current_actor or cand.frame_color is None:
+                continue
+            if self._bbox_intersects_with_margin(old_obj.bbox, cand.bbox, 3):
+                return True
+        return False
 
     def _enforce_transition_evidence_contract(self, pending: PendingAction, report: TransitionReport, current_scene: SceneSnapshot, outcome: str) -> None:
         level = self.memory.level
         current_actor = level.controlled_object_id
         disappeared = set(report.disappeared_object_ids)
         if current_actor and current_actor in disappeared:
-            if report.controlled_candidate_id and current_scene.object_by_id(report.controlled_candidate_id) is not None:
+            new_candidate_obj = current_scene.object_by_id(report.controlled_candidate_id) if report.controlled_candidate_id else None
+            if new_candidate_obj is not None:
                 level.controlled_object_id = report.controlled_candidate_id
                 level.local_bindings["actor"] = report.controlled_candidate_id
             else:
                 level.controlled_object_id = ""
                 level.local_bindings.pop("actor", None)
+            merged = (
+                outcome not in {"retry"}
+                and report.life_delta in (None, 0)
+                and self._actor_merged_into_container(pending, current_actor, new_candidate=new_candidate_obj)
+            )
             if self._should_preserve_vlm_route_plan_after_rebind(pending, report):
                 level.notes_for_next_call = "Controlled object id changed during a progressing VLM route; preserve remaining route steps and re-bind actor."
                 self.logger.log_event("plan_preserved_v20", {"level": level.level_index, "reason": "actor_disappeared_rebind_during_vlm_route", "old_actor": current_actor, "new_actor": report.controlled_candidate_id})
+            elif merged:
+                # ls20-style: the actor overlapped a framed container (lock) and the
+                # tracker fused them into one object. Clearing the plan on every such
+                # toggle causes a bottleneck/VLM storm; keep the plan and tell the VLM.
+                level.notes_for_next_call = "Actor visually merged into a framed container; it is likely still there. Moving away (e.g. the opposite direction) should separate them. Do not re-plan from scratch."
+                self.logger.log_event("plan_preserved_v20", {"level": level.level_index, "reason": "actor_merged_into_container", "old_actor": current_actor, "new_actor": report.controlled_candidate_id})
             else:
                 self._invalidate_plan_steps("actor_disappeared_rebind", clear_all=True)
                 level.notes_for_next_call = "Controlled object disappeared or changed; re-bind actor and goal before continuing."
-            self.logger.log_event("actor_binding_invalidated_v20", {"level": level.level_index, "old_actor": current_actor, "new_candidate": report.controlled_candidate_id, "reason": "actor_disappeared"})
+            self.logger.log_event("actor_binding_invalidated_v20", {"level": level.level_index, "old_actor": current_actor, "new_candidate": report.controlled_candidate_id, "reason": "actor_merged_into_container" if merged else "actor_disappeared"})
             return
         if pending.source == "plan_executor" and pending.name != "ACTION6":
             if report.effective_noop:
@@ -2477,6 +3207,250 @@ class MyAgent(_BaseAgent):
             outcomes = {"noop", "retry"}
         return all(e.outcome in outcomes for e in recent)
 
+    def _source_low_yield_active(self, source: str, *, outcomes: set[str], min_ratio: float = 0.85) -> bool:
+        level = self.memory.level
+        window = max(4, self.config.force_source_fuse_after)
+        recent = list(level.recent_events)[-window:]
+        if len(recent) < window:
+            return False
+        source_events = [e for e in recent if e.source == source]
+        if len(source_events) < max(4, int(window * 0.75)):
+            return False
+
+        def low_yield_event(event: CompactEvent) -> bool:
+            if event.outcome in outcomes:
+                return True
+            delta = event.transition_delta if isinstance(event.transition_delta, dict) else {}
+            try:
+                progress = float(delta.get("progress_score", 1.0))
+            except Exception:
+                progress = 1.0
+            try:
+                changed = int(delta.get("changed_cell_count", 999))
+            except Exception:
+                changed = 999
+            structural = bool(delta.get("appeared") or delta.get("disappeared") or delta.get("controlled_candidate_id"))
+            if source == "deterministic_click" and event.outcome in {"transform", "movement", "interaction"}:
+                structural_churn = bool(delta.get("transformed_objects") or delta.get("appeared") or delta.get("disappeared")) and not bool(delta.get("simple_translation"))
+                if structural_churn:
+                    return True
+            if progress <= 0.25:
+                return True
+            return event.outcome in {"transform", "movement", "interaction"} and changed <= 2 and not structural
+
+        low_yield = sum(1 for e in source_events if low_yield_event(e))
+        return low_yield / max(1, len(source_events)) >= min_ratio
+
+    def _click_only_noop_flood_active(self, legal: Sequence[Any]) -> bool:
+        if not self._click_only_legal(legal):
+            return False
+        level = self.memory.level
+        window = min(8, max(4, self.config.force_source_fuse_after))
+        recent = list(level.recent_events)[-window:]
+        if len(recent) < window:
+            return False
+        click_events = [e for e in recent if e.source == "deterministic_click"]
+        if len(click_events) < max(4, int(window * 0.75)):
+            return False
+        low_yield = sum(1 for e in click_events if e.outcome in {"noop", "state_change", "retry"})
+        return low_yield / max(1, len(click_events)) >= 0.75
+
+    def _normal_click_low_yield_flood_active(self) -> bool:
+        level = self.memory.level
+        window = max(4, self.config.force_source_fuse_after)
+        recent = list(level.recent_events)[-window:]
+        if len(recent) < window:
+            return False
+        normal_sources = {"deterministic_click", "frontier_probe"}
+        click_events = [e for e in recent if e.action_key.startswith("ACTION6:") and e.source in normal_sources]
+        if len(click_events) < max(4, int(window * 0.75)):
+            return False
+
+        def low_yield(event: CompactEvent) -> bool:
+            if event.outcome in {"noop", "state_change", "retry"}:
+                return True
+            delta = event.transition_delta if isinstance(event.transition_delta, dict) else {}
+            try:
+                progress = float(delta.get("progress_score", 1.0))
+            except Exception:
+                progress = 1.0
+            if progress <= 0.25:
+                return True
+            structural_churn = bool(delta.get("transformed_objects") or delta.get("appeared") or delta.get("disappeared")) and not bool(delta.get("simple_translation"))
+            return event.outcome in {"transform", "movement", "interaction"} and structural_churn
+
+        return sum(1 for e in click_events if low_yield(e)) / max(1, len(click_events)) >= 0.75
+
+    def _normal_click_fuse_active(self, scene: SceneSnapshot, legal: Sequence[Any], source: str) -> bool:
+        level = self.memory.level
+        cooldown_active = level.click_fuse_block_until > level.total_action_count
+        active = cooldown_active
+        if not active:
+            active = (
+                self._source_storm_active("deterministic_click", outcomes={"noop", "state_change"})
+                or self._source_low_yield_active("deterministic_click", outcomes={"noop", "state_change"})
+                or self._click_only_noop_flood_active(legal)
+                or self._normal_click_low_yield_flood_active()
+            )
+        if not active:
+            return False
+        level.bottleneck_reason = "deterministic_click_low_yield"
+        level.action_recovery_contract = True
+        level.fallback_guard_block_until = max(level.fallback_guard_block_until, level.total_action_count + 1)
+        level.click_fuse_block_until = max(level.click_fuse_block_until, level.total_action_count + max(3, self.config.quarantine_steps))
+        self._record_click_fuse_feedback(scene, source)
+        if not cooldown_active:
+            self.logger.log_event("source_fuse_open_v20", {"level": level.level_index, "source": source, "state": scene.state_hash[:12], "reason": "low_yield_click_flood"})
+        return True
+
+    def _record_click_fuse_feedback(self, scene: SceneSnapshot, source: str) -> None:
+        level = self.memory.level
+        recent = [
+            {"action": e.action_key, "source": e.source, "outcome": e.outcome}
+            for e in list(level.recent_events)[-8:]
+            if e.action_key.upper().startswith("ACTION6")
+        ]
+        feedback = {
+            "stage": "source_fuse",
+            "reason": "click_low_yield_fuse",
+            "source": source,
+            "state": scene.state_hash[:12],
+            "recent_click_outcomes": recent[-6:],
+            "requirement": "Do not broad-remap or sweep fresh click coordinates; propose a state-conditioned click sequence or a different mechanism.",
+        }
+        last = level.rejected_vlm_plan_feedback[-1] if level.rejected_vlm_plan_feedback else {}
+        if last.get("reason") == feedback["reason"] and last.get("source") == source and last.get("state") == feedback["state"]:
+            return
+        level.rejected_vlm_plan_feedback.append(feedback)
+        level.rejected_vlm_plan_feedback = level.rejected_vlm_plan_feedback[-12:]
+
+    def _focused_action6_target(self, scene: SceneSnapshot, blocked: set[str]) -> tuple[int, int, str] | None:
+        state_click = self._state_conditioned_success_click(scene, blocked)
+        if state_click is not None:
+            return state_click[0], state_click[1], ""
+        success_neighbor = self._successful_click_neighbor(scene, blocked)
+        if success_neighbor is not None:
+            return success_neighbor[0], success_neighbor[1], ""
+        return None
+
+    def _click_fuse_blocks_broad_click(self, scene: SceneSnapshot, legal: Sequence[Any], source: str, blocked: set[str]) -> bool:
+        if not self._normal_click_fuse_active(scene, legal, source):
+            return False
+        return self._focused_action6_target(scene, blocked) is None
+
+    def _transition_matches_expected(self, report: TransitionReport, step: PlanStep, visits_before: int | None = None) -> bool:
+        preds = step.expected_predicates or []
+        default_match = bool(
+            not report.effective_noop
+            and not report.retry_detected
+            and report.life_delta in (None, 0)
+            and not self._minor_structural_churn(report, visits_before)
+        )
+        if not preds:
+            return default_match
+        if self._minor_structural_churn(report, visits_before):
+            return False
+        outcome = self._classify_outcome(report)
+        recognized = 0
+        for pred in preds:
+            # V2.2: unknown/free-form predicate kinds are ignored instead of failing
+            # the whole step. The old hard-fail turned every VLM improvisation into a
+            # "predicate mismatch" and (via the contract) into an action ban.
+            if not isinstance(pred, dict):
+                continue
+            kind = _short(pred.get("type") or pred.get("predicate"), 80).lower()
+            if not kind:
+                continue
+            if kind == "not_noop":
+                recognized += 1
+                if report.effective_noop:
+                    return False
+            elif kind == "no_life_loss":
+                recognized += 1
+                if report.life_delta is not None and report.life_delta < 0:
+                    return False
+            elif kind == "no_retry":
+                recognized += 1
+                if report.retry_detected:
+                    return False
+            elif kind == "controlled_motion":
+                recognized += 1
+                if self._controlled_motion(report) is None:
+                    return False
+            elif kind == "appeared_or_disappeared":
+                recognized += 1
+                if not (report.appeared_object_ids or report.disappeared_object_ids):
+                    return False
+            elif kind == "structural_change":
+                recognized += 1
+                if not (report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids or report.interaction_event):
+                    return False
+            elif kind == "outcome_in":
+                values = pred.get("values")
+                if not isinstance(values, list) or not values:
+                    continue
+                allowed = {_short(v, 80) for v in values if _short(v, 80)}
+                recognized += 1
+                if outcome not in allowed:
+                    return False
+        if recognized == 0:
+            return default_match
+        return True
+
+    def _transition_progress_score(self, pending: PendingAction, report: TransitionReport, current_scene: SceneSnapshot) -> float:
+        level = self.memory.level
+        if report.retry_detected:
+            return -10.0
+        if report.life_delta is not None and report.life_delta < 0:
+            return -8.0
+        score = 0.0
+        if report.effective_noop:
+            score -= 2.0
+        else:
+            score += 0.25
+        # Genuinely new states (never visited this level) are real progress; revisiting
+        # a seen state is churn unless we got there by controlled motion (backtracking).
+        # When nearly every transition lands on a never-seen state (ambient animation,
+        # e.g. tr87 moving pieces), "new state" carries almost no information, so both
+        # the bonus and the revisit penalty are dampened.
+        total_visits = sum(level.all_state_visits.values())
+        unique_states = len(level.all_state_visits)
+        ambient_drift = total_visits >= 20 and unique_states / max(1, total_visits) >= 0.9
+        visits_before = level.all_state_visits.get(current_scene.state_hash, 0)
+        controlled = self._controlled_motion(report) is not None
+        if visits_before == 0:
+            score += 0.2 if ambient_drift else 0.8
+        elif controlled:
+            score -= 0.2
+        else:
+            score -= 0.3 if ambient_drift else 1.25
+        if report.counter_delta is not None and report.counter_delta < 0 and report.effective_noop:
+            score -= 1.5
+        if report.interaction_event:
+            score += 0.8
+        if report.appeared_object_ids or report.disappeared_object_ids:
+            score += 0.5
+        if controlled:
+            score += 0.4
+        # Cycling transform: pixels change but we keep landing on already-seen states
+        # without controlled motion or resource gain -> churn, not progress.
+        if (
+            (report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids)
+            and visits_before >= 1
+            and not controlled
+            and (report.counter_delta is None or report.counter_delta <= 0)
+        ):
+            score -= 1.5
+        if self._minor_structural_churn(report, visits_before):
+            score -= 2.0
+        step = level.active_step()
+        if step is not None and pending.source == "plan_executor":
+            if self._transition_matches_expected(report, step, visits_before):
+                score += 1.5
+            else:
+                score -= 0.8
+        return score
+
     def _update_plan_after_transition(self, pending: PendingAction, report: TransitionReport, current_scene: SceneSnapshot) -> None:
         level = self.memory.level
         step = level.active_step()
@@ -2507,11 +3481,23 @@ class MyAgent(_BaseAgent):
             step.status = "done"
             level.plan_cursor += 1
             return
-        if report.interaction_event or report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids:
-            step.status = "done"
-            level.plan_cursor += 1
-            return
-        if step.step_type in {"probe_action", "probe_object", "click"} and not report.effective_noop:
+        visits_before = level.all_state_visits.get(current_scene.state_hash, 0)
+        matched = self._transition_matches_expected(report, step, visits_before)
+        if pending.source == "plan_executor":
+            if matched:
+                step.status = "done"
+                level.plan_cursor += 1
+                return
+            if not report.effective_noop:
+                # V2.2: a wrong VLM prediction is not evidence the action is harmful.
+                # The old contract-forbid here banned ordinary actions ~500x/run and
+                # fed a bottleneck->VLM->ban storm; keep the bookkeeping only.
+                step.status = "failed"
+                level.plan_cursor += 1
+                level.bottleneck_reason = "plan_step_expected_predicate_mismatch"
+                level.action_recovery_contract = True
+                return
+        if matched and step.step_type in {"probe_action", "probe_object", "click"}:
             step.status = "done"
             level.plan_cursor += 1
 
@@ -2529,14 +3515,29 @@ class MyAgent(_BaseAgent):
         structural_change = bool(report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids)
         if report.effective_noop:
             meaning.noops += 1
-        if report.retry_detected:
+        # V2.2: in a confirmed step-tax game (counter drains 1/step, refills on
+        # bankruptcy and costs a life) the death is the tax running out, NOT evidence
+        # that whichever action ran at counter=0 is dangerous. Attributing retry/
+        # life_loss to that action permanently poisoned it -> _resource_risky flagged
+        # the whole action space -> resource_guard contracts stuck forever ->
+        # absolute_nonreset lockup (ls20 absEx 3->16, all 4 actions blacklisted).
+        if report.retry_detected and not level.counter_is_step_tax:
             meaning.retries += 1
-        if report.life_delta is not None and report.life_delta < 0:
+        if report.life_delta is not None and report.life_delta < 0 and not level.counter_is_step_tax:
             meaning.life_losses += 1
         if structural_change:
             meaning.transforms += 1
             if world_changed_cells <= 2 and not report.moved_objects:
-                meaning.small_transforms += 1
+                # V2.6: sb26 regression - counting every small transform toward the
+                # resource_wasting_noop signal below poisoned ACTION5 (a selector bar
+                # that shrinks by 1-3 cells per press, i.e. the actual win mechanism)
+                # after just 3 presses, permanently hard-blocking it in
+                # _action_blocked for the rest of the level. A small pixel footprint
+                # only signals a decorative ticker once it starts repeating an
+                # already-seen state; landing on a brand-new state each time is real
+                # progress, same distinction _minor_structural_churn makes.
+                if level.all_state_visits.get(current_scene.state_hash, 0) > 0:
+                    meaning.small_transforms += 1
         if report.interaction_event:
             meaning.interactions += 1
         event_id = self.memory.next_event_id
@@ -2552,10 +3553,38 @@ class MyAgent(_BaseAgent):
             meaning.vector = None
             return
         move = self._controlled_motion(report, level.controlled_object_id) if name != "ACTION6" else None
+        # V2.2: never derive a movement vector from (a) a ticker object's drift or
+        # (b) a retry/life-loss transition. tu93 learned ACTION2 = (-18,0) from the
+        # death-scroll displacement of its controlled object, and genuine timer bars
+        # occasionally get picked as the largest mover. Both poison navigation.
+        if move is not None:
+            moved_id = str(move.get("object_id") or "")
+            if (moved_id in level.ticker_object_ids and moved_id != level.controlled_object_id) or report.retry_detected or (report.life_delta is not None and report.life_delta < 0):
+                move = None
         if move is not None:
             vec = (int(move["dx"]), int(move["dy"]))
             side_effect = bool(report.transformed_objects or report.appeared_object_ids or report.disappeared_object_ids or report.interaction_event)
             meaning.vector_votes[_vector_key(vec)] += 1
+            meaning.movements += 1
+            if side_effect and not report.is_simple_translation:
+                dominant = _dominant_vector(meaning.vector_votes)
+                # V2.2: judge by displacement consistency, not by "pure" movements.
+                # The old pure_movement_votes = movements - transforms - interactions
+                # is permanently <=0 in games where every move has side effects
+                # (re86/ar25 coupled frames), so vectors could never be confirmed and
+                # the whole vector-exemption navigation channel stayed dead.
+                dominant_majority = dominant is not None and dominant[1] >= 2 and dominant[1] * 2 > meaning.movements
+                if dominant_majority and meaning.noop_ratio < 0.35:
+                    meaning.vector = dominant[0]
+                    meaning.kind = "movement"
+                    meaning.meaning_nl = f"moves by {dominant[0]} with possible side effects"
+                    meaning.confidence = max(meaning.confidence, 0.58)
+                else:
+                    meaning.vector = None
+                    meaning.kind = "interact_or_transform"
+                    meaning.meaning_nl = f"moves/changes scene with side effects: {summary_nl}"
+                    meaning.confidence = max(meaning.confidence, 0.58)
+                return
             learned_vec = vec
             dominant = _dominant_vector(meaning.vector_votes)
             if meaning.vector is not None and meaning.vector != vec:
@@ -2576,7 +3605,6 @@ class MyAgent(_BaseAgent):
                 learned_vec = dominant[0]
             meaning.vector = learned_vec
             meaning.kind = "movement"
-            meaning.movements += 1
             if learned_vec == vec:
                 meaning.meaning_nl = f"moves the controlled object by vector {vec}" + (" with side effects" if side_effect else "")
             else:
@@ -2620,22 +3648,31 @@ class MyAgent(_BaseAgent):
         if candidate not in moved_ids:
             return
         level.actor_votes[candidate] += 1
-        best, votes = level.actor_votes.most_common(1)[0]
+        best = level.actor_votes.most_common(1)[0][0]
         candidate_votes = level.actor_votes[candidate]
         controlled_move = self._controlled_motion(report, candidate)
         moved_count = len(moved_ids)
+        structural_side_effect = bool(
+            report.transformed_objects
+            or report.appeared_object_ids
+            or report.disappeared_object_ids
+            or (report.interaction_event and not report.is_simple_translation)
+        )
         adopt = controlled_move is not None and report.is_simple_translation
         adopt = adopt or (
             controlled_move is not None
-            and not report.transformed_objects
+            and not structural_side_effect
             and moved_count <= 2
             and (not old_actor or old_actor == candidate or old_actor not in moved_ids)
         )
         adopt = adopt or (
             candidate_votes >= 2
+            and not structural_side_effect
             and (not old_actor or old_actor not in moved_ids or old_actor == candidate)
             and (moved_count <= 3 or old_actor == candidate)
         )
+        if old_actor and candidate != old_actor and structural_side_effect and not report.is_simple_translation:
+            adopt = False
         if adopt:
             chosen = candidate
             level.controlled_object_id = chosen
@@ -2669,26 +3706,110 @@ class MyAgent(_BaseAgent):
                 if color != after.background_candidate:
                     self.memory.level.walkable_color_votes[color] += 1
 
-    def _update_click_memory(self, pending: PendingAction, report: TransitionReport) -> None:
+    def _update_click_memory(self, pending: PendingAction, report: TransitionReport, current_scene: SceneSnapshot) -> None:
         if pending.name != "ACTION6":
             return
-        self.memory.level.click_coord_counts[pending.action_key()] += 1
+        level = self.memory.level
+        before_state = pending.scene_before.state_hash
+        after_state = current_scene.state_hash
+        key = pending.action_key()
+        level.click_coord_counts[key] += 1
         if pending.x is not None and pending.y is not None:
-            self.memory.level.click_region_counts[self._click_region_key(pending.x, pending.y)] += 1
+            level.click_region_counts[self._click_region_key(pending.x, pending.y)] += 1
         oid = pending.target_object_id or ""
+        meaningful_transform = bool(
+            report.transformed_objects
+            and (
+                report.world_changed_cell_count > 2
+                or report.appeared_object_ids
+                or report.disappeared_object_ids
+                or report.controlled_candidate_id
+            )
+        )
+        unstable_deterministic_click = bool(
+            pending.source == "deterministic_click"
+            and not report.is_simple_translation
+            and (
+                len(report.moved_objects) > 1
+                or report.appeared_object_ids
+                or report.disappeared_object_ids
+                or (report.transformed_objects and report.controlled_candidate_id)
+            )
+        )
         progress_like = bool(
             report.controlled_candidate_id
             or report.appeared_object_ids
             or report.disappeared_object_ids
             or report.is_simple_translation
+            or (report.interaction_event and report.world_changed_cell_count > 2)
+            or meaningful_transform
         )
-        if report.effective_noop or not progress_like:
-            self.memory.level.click_noops_by_object[oid] += 1
-        else:
-            self.memory.level.click_success_by_object[oid] += 1
-            if pending.x is not None and pending.y is not None:
-                self.memory.level.click_success_coords[pending.action_key()] += 1
-                self.memory.level.click_success_regions[self._click_region_key(pending.x, pending.y)] += 1
+        # V2.1: a click that only flips decorative/cycling pixels (lands on an already
+        # seen state without controlled motion or counter change) is churn, not a
+        # "successful" click. Recording it as success previously granted positive
+        # evidence that bypassed the per-coordinate click limit (ft09 38,38 loop).
+        cycling_click = bool(
+            not report.controlled_candidate_id
+            and not report.is_simple_translation
+            and (report.counter_delta is None or report.counter_delta <= 0)
+            and report.life_delta in (None, 0)
+            and level.all_state_visits.get(after_state, 0) >= 1
+        )
+        if report.effective_noop or not progress_like or unstable_deterministic_click or cycling_click:
+            level.click_noops_by_object[oid] += 1
+            return
+        level.click_success_by_object[oid] += 1
+        level.successful_clicks_by_state.setdefault(before_state, Counter())[key] += 1
+        level.click_edges_by_state.setdefault(before_state, {})[key] = after_state
+        if pending.x is not None and pending.y is not None:
+            level.click_success_coords[key] += 1
+            level.click_success_regions[self._click_region_key(pending.x, pending.y)] += 1
+
+    def _hidden_resource_transition_consumed(self, pending: PendingAction, report: TransitionReport, outcome: str, current_scene: SceneSnapshot) -> bool:
+        if pending.name == "RESET":
+            return False
+        if pending.scene_before.counter_value is not None or current_scene.counter_value is not None:
+            return False
+        if pending.scene_before.counter_ratio is not None or current_scene.counter_ratio is not None:
+            return False
+        if outcome in {"retry", "level_advanced"}:
+            return True
+        if pending.name == "ACTION6":
+            return bool(outcome not in {"noop", "state_change"} and not report.effective_noop)
+        return True
+
+    def _hidden_resource_remaining_ratio(self) -> float | None:
+        cap = self.memory.game.resource_model.hidden_action_budget_capacity
+        if cap is None or cap <= 0:
+            return None
+        used = max(0, self.memory.level.hidden_resource_used_this_attempt)
+        return max(0.0, min(1.0, (cap - used) / cap))
+
+    def _infer_hidden_resource_budget_from_game_over(self, scene: SceneSnapshot) -> None:
+        level = self.memory.level
+        used = int(level.hidden_resource_used_this_attempt)
+        if used < 8:
+            return
+        if scene.counter_value is not None or scene.counter_ratio is not None or scene.life_count is not None:
+            return
+        res = self.memory.game.resource_model
+        res.hidden_budget_observations.append(used)
+        res.hidden_budget_observations = res.hidden_budget_observations[-8:]
+        inferred = min(res.hidden_budget_observations)
+        if res.hidden_action_budget_capacity is None or inferred < res.hidden_action_budget_capacity:
+            res.hidden_action_budget_capacity = inferred
+        res.hidden_budget_source = "game_over_effective_action_count"
+        res.description_nl = res.description_nl or "A hidden action/effect budget is inferred from GAME_OVER timing; avoid low-information probes near the inferred limit."
+        self.logger.log_event(
+            "hidden_resource_budget_inferred_v20",
+            {
+                "level": level.level_index,
+                "attempt": level.attempt_index,
+                "used_this_attempt": used,
+                "capacity": res.hidden_action_budget_capacity,
+                "observations": list(res.hidden_budget_observations),
+            },
+        )
 
     def _update_resource_model_from_scene(self, scene: SceneSnapshot) -> None:
         res = self.memory.game.resource_model
@@ -2701,23 +3822,56 @@ class MyAgent(_BaseAgent):
     def _refresh_strategic_flags(self, scene: SceneSnapshot, transition: TransitionReport | None) -> None:
         level = self.memory.level
         previous_lives = self.memory.game.resource_model.last_lives
+        counter_low = False
         if scene.counter_ratio is not None:
             if scene.counter_ratio <= self.config.low_resource_ratio:
-                level.resource_crisis = True
+                counter_low = True
                 level.bottleneck_reason = level.bottleneck_reason or "low_resource_counter"
             if scene.counter_ratio <= self.config.critical_resource_ratio:
+                counter_low = True
                 level.current_plan = []
                 level.plan_cursor = 0
                 level.bottleneck_reason = "critical_resource_counter"
-        if scene.life_count is not None and previous_lives is not None and scene.life_count < previous_lives:
-            level.resource_crisis = True
+        if scene.counter_value is not None and scene.counter_value <= 1:
+            counter_low = True
+        hidden_ratio = self._hidden_resource_remaining_ratio()
+        if hidden_ratio is not None:
+            if hidden_ratio <= self.config.low_resource_ratio:
+                counter_low = True
+                level.bottleneck_reason = level.bottleneck_reason or "low_hidden_resource_budget"
+            if hidden_ratio <= self.config.critical_resource_ratio:
+                counter_low = True
+                level.current_plan = []
+                level.plan_cursor = 0
+                level.bottleneck_reason = "critical_hidden_resource_budget"
+        life_lost = bool(scene.life_count is not None and previous_lives is not None and scene.life_count < previous_lives)
+        life_critical = bool(scene.life_count is not None and scene.life_count <= 1)
+        if life_lost:
             level.current_plan = []
             level.plan_cursor = 0
             level.bottleneck_reason = "life_loss_detected"
-        if transition is not None and (transition.transformed_objects or transition.appeared_object_ids or transition.disappeared_object_ids) and self._controlled_motion(transition) is None:
-            level.transform_pressure += 1
-        if level.transform_pressure >= self.config.transform_mode_threshold:
+        if counter_low:
+            level.resource_crisis = True
+        elif level.resource_crisis and self._resource_recovered_from_scene(scene):
+            level.resource_crisis = False
+            if level.bottleneck_reason in {"low_resource_counter", "critical_resource_counter", "resource_crisis_no_safe_fallback"}:
+                level.bottleneck_reason = ""
+            # V2.2: crisis-time resource_guard bans must not outlive the crisis. They
+            # are state-keyed and previously stayed forever, locking the same states
+            # into the exhausted-guard chain even after the counter refilled (ls20).
+            cleared_rules = 0
+            for rules in level.contract_forbidden_by_state.values():
+                for rule_key in [k for k, v in rules.items() if str(v).startswith("resource_guard:")]:
+                    del rules[rule_key]
+                    cleared_rules += 1
+            self.logger.log_event("resource_crisis_cleared_v20", {"level": level.level_index, "state": scene.state_hash[:12], "counter": scene.counter_value, "ratio": scene.counter_ratio, "lives": scene.life_count, "resource_guard_rules_cleared": cleared_rules})
+        if life_critical and not counter_low:
+            level.bottleneck_reason = level.bottleneck_reason or "life_critical"
+        transform_mode_active = self._transform_bottleneck_active()
+        if transform_mode_active:
             level.bottleneck_reason = level.bottleneck_reason or "transform_mode"
+        elif level.bottleneck_reason == "transform_mode":
+            level.bottleneck_reason = ""
         self._update_resource_model_from_scene(scene)
 
     def _record_game_over(self, scene: SceneSnapshot, transition: TransitionReport | None) -> None:
@@ -2735,7 +3889,8 @@ class MyAgent(_BaseAgent):
         if suffix:
             note = f"failed_attempt_{level.attempt_index}: GAME_OVER after suffix={suffix}"
             self.memory.game.advisory_notes = _short((self.memory.game.advisory_notes + "\n" + note).strip(), 900)
-        self.logger.log_event("game_over_v20", {"level": level.level_index, "attempt": level.attempt_index, "steps": level.total_action_count, "counter": scene.counter_value, "lives": scene.life_count, "transition": transition.summary if transition else None, "known_noops_preserved": sum(len(v) for v in level.known_noops_by_state.values()), "suffix": suffix})
+        self._infer_hidden_resource_budget_from_game_over(scene)
+        self.logger.log_event("game_over_v20", {"level": level.level_index, "attempt": level.attempt_index, "steps": level.total_action_count, "counter": scene.counter_value, "lives": scene.life_count, "hidden_resource_used": level.hidden_resource_used_this_attempt, "hidden_resource_capacity": self.memory.game.resource_model.hidden_action_budget_capacity, "transition": transition.summary if transition else None, "known_noops_preserved": sum(len(v) for v in level.known_noops_by_state.values()), "suffix": suffix})
         self._flush_last_vlm_io("game_over")
 
     def _record_level_success(self, scene: SceneSnapshot, new_levels_completed: int) -> None:
@@ -2868,25 +4023,69 @@ class MyAgent(_BaseAgent):
             backend_available = False
         return bool(self.config.enable_vlm and backend_available)
 
+    def _vlm_temperature(self) -> float:
+        # 升温只用于打破“同 prompt 同确定性答案”的死循环，正常对局保持 temperature=0。
+        level = self.memory.level
+        # 空计划/彻底无法解析的输出在 temperature=0 下都会确定性复现（实测 r11l 连续 9
+        # 次空计划、ls20/dc22 连续 5 次空计划；ls20 另有一次连续复读非 JSON 长文本）；
+        # notes 反馈不足以改变确定性输出，必须靠采样随机性跳出，因此升温而非归零。
+        if level.consecutive_empty_plans >= 1:
+            return 0.9 if level.consecutive_empty_plans >= 2 else 0.7
+        if level.vlm_issue_repeat_count >= 3:
+            return 0.7
+        last_reject = level.rejected_vlm_plan_feedback[-1] if level.rejected_vlm_plan_feedback else None
+        if isinstance(last_reject, dict):
+            try:
+                if level.total_action_count - int(last_reject.get("at_action_count", -999)) <= 8:
+                    return 0.7
+            except Exception:
+                pass
+        return 0.0
+
     def _update_vlm_issue_state(self, scene: SceneSnapshot, transition: TransitionReport | None) -> None:
         level = self.memory.level
         outcome = ""
         if transition is not None:
             outcome = "retry" if transition.retry_detected else "noop" if transition.effective_noop else "transform" if (transition.transformed_objects or transition.appeared_object_ids or transition.disappeared_object_ids) else "move" if transition.moved_objects else "change"
         signature = f"{scene.state_hash}:{level.bottleneck_reason}:{outcome}"
+        seen_in_window = sum(1 for s in level.vlm_issue_recent_signatures if s == signature)
+        level.vlm_issue_recent_signatures.append(signature)
         if signature == level.vlm_issue_signature:
             level.vlm_issue_repeat_count += 1
+        elif seen_in_window:
+            # Alternating signatures (state ping-pong) still count as a repeating issue.
+            level.vlm_issue_signature = signature
+            level.vlm_issue_repeat_count = max(2, level.vlm_issue_repeat_count)
         else:
             level.vlm_issue_signature = signature
             level.vlm_issue_repeat_count = 1
+
+    def _vlm_pacing_blocked(self) -> bool:
+        # Spread the per-level call budget over the whole action budget. Without this,
+        # bottleneck storms burn all calls in the first ~25 actions and the rest of the
+        # episode runs on blind local fallbacks (observed on ls20/ft09/tr87/ar25).
+        level = self.memory.level
+        if not level.initial_vlm_done and not level.initial_vlm_attempted:
+            return False
+        # Measure progress within the current attempt: after a game over the call
+        # budget resets, so pacing must not treat the whole-episode step count as
+        # already-earned allowance (that would re-allow an instant burst).
+        attempt_actions = max(0, level.total_action_count - level.attempt_started_at_action_count)
+        remaining_budget = max(1, self.MAX_ACTIONS - level.attempt_started_at_action_count)
+        progress = min(1.0, attempt_actions / remaining_budget)
+        pace_cap = int(math.ceil(self.config.max_vlm_calls_per_level * progress)) + self.config.vlm_budget_burst
+        return level.vlm_calls_this_level >= pace_cap
 
     def _should_call_vlm(self, scene: SceneSnapshot, transition: TransitionReport | None, legal: Sequence[Any] | None = None, *, force_bottleneck: bool = False) -> bool:
         level = self.memory.level
         if not self._vlm_available() or level.vlm_calls_this_level >= self.config.max_vlm_calls_per_level:
             return False
+        if self._vlm_pacing_blocked():
+            return False
         if force_bottleneck:
             return True
 
+        transform_mode_active = self._transform_bottleneck_active()
         active_step = level.active_step()
         active_raw = active_step.raw if active_step is not None and isinstance(active_step.raw, dict) else {}
         route_reason = _short(active_raw.get("route_reason"), 80) if active_raw else ""
@@ -2912,7 +4111,7 @@ class MyAgent(_BaseAgent):
                 if level.actions_since_vlm < sequence_grace and level.repeated_noop_streak < 2:
                     return False
 
-        if not level.initial_vlm_done:
+        if not level.initial_vlm_done and not level.initial_vlm_attempted:
             return True
         if legal is not None and level.active_step() is None and level.actions_since_vlm >= 1:
             legal_names = {action_name(a).upper() for a in legal}
@@ -2926,12 +4125,17 @@ class MyAgent(_BaseAgent):
         if level.bottleneck_reason:
             if level.action_recovery_contract and level.bottleneck_reason == "plan_step_noop" and level.actions_since_vlm >= 1:
                 return True
-            if level.vlm_issue_repeat_count >= 2 and level.actions_since_vlm < self.config.vlm_repeat_bottleneck_cooldown:
-                return False
+            if level.vlm_issue_repeat_count >= 2:
+                # V2.2: escalate the cooldown while the same issue keeps repeating.
+                # A flat 3-step cooldown still allowed ~86% of all calls to be
+                # bottleneck re-asks that returned the same answer (4s each).
+                cooldown = min(12, self.config.vlm_repeat_bottleneck_cooldown * (level.vlm_issue_repeat_count - 1))
+                if level.actions_since_vlm < cooldown:
+                    return False
             return level.actions_since_vlm >= max(0, self.config.vlm_min_action_gap - 1)
         if level.resource_crisis and level.actions_since_vlm >= max(0, self.config.vlm_min_action_gap - 1):
             return True
-        if level.transform_pressure >= self.config.transform_mode_threshold and level.actions_since_vlm >= self.config.vlm_min_action_gap:
+        if transform_mode_active and level.actions_since_vlm >= self.config.vlm_min_action_gap:
             return True
         if transition is not None and (transition.retry_detected or transition.transformed_objects or transition.appeared_object_ids or transition.disappeared_object_ids or transition.life_delta not in (None, 0)) and level.actions_since_vlm >= self.config.vlm_min_action_gap:
             return True
@@ -2940,8 +4144,9 @@ class MyAgent(_BaseAgent):
         if level.chunk_action_count >= self.config.max_chunk_steps and level.actions_since_vlm >= self.config.vlm_min_action_gap:
             return True
         if level.active_step() is None and level.actions_since_vlm >= self.config.vlm_min_action_gap:
-            return True
-        if len(level.recent_state_hashes) >= 6 and max(Counter(level.recent_state_hashes).values()) >= 3:
+            return level.initial_vlm_done or not level.initial_vlm_attempted
+        loop_active, _, _ = self._unproductive_state_loop_signal(scene)
+        if loop_active:
             return True
         return False
 
@@ -2949,9 +4154,10 @@ class MyAgent(_BaseAgent):
         if not self._should_call_vlm(scene, transition, legal):
             return
         level = self.memory.level
-        if not level.initial_vlm_done:
+        transform_mode_active = self._transform_bottleneck_active()
+        if not level.initial_vlm_done and not level.initial_vlm_attempted:
             mode = VLMMode.LEVEL_INIT
-        elif level.bottleneck_reason or level.resource_crisis or level.transform_pressure >= self.config.transform_mode_threshold:
+        elif level.bottleneck_reason or level.resource_crisis or transform_mode_active:
             mode = VLMMode.BOTTLENECK
         else:
             mode = VLMMode.EVALUATE_CHUNK
@@ -2961,8 +4167,12 @@ class MyAgent(_BaseAgent):
         level = self.memory.level
         if not self._vlm_available() or level.vlm_calls_this_level >= self.config.max_vlm_calls_per_level:
             return None
+        if self._vlm_pacing_blocked():
+            return None
+        if mode == VLMMode.LEVEL_INIT:
+            level.initial_vlm_attempted = True
         prompt = self._build_vlm_prompt(scene, transition, legal, mode.value)
-        request = VLMRequest(prompt, scene.rgb or render_grid(scene.grid, self.config.image_size), None if transition is None else transition.previous_rgb, scene.annotated_rgb, self.config.vlm_max_new_tokens)
+        request = VLMRequest(prompt, scene.rgb or render_grid(scene.grid, self.config.image_size), None if transition is None else transition.previous_rgb, scene.annotated_rgb, self.config.vlm_max_new_tokens, temperature=self._vlm_temperature())
         level.vlm_calls_this_level += 1
         self.memory.game.vlm_calls_total += 1
         level.last_vlm_mode = mode.value
@@ -2982,7 +4192,12 @@ class MyAgent(_BaseAgent):
             self._record_vlm_io(request, raw_response, result, mode=mode.value, call=call, parse_status=parse_status, error=error, context=call_context)
             return None
         if result is None:
-            self.logger.log_event("vlm_invalid", {"mode": mode.value, "raw_excerpt": "empty_or_unparseable"})
+            # A totally unparseable response is the same "no usable plan" failure as
+            # a parsed-but-empty one below; without counting it here it never feeds
+            # consecutive_empty_plans, so _vlm_temperature() would keep retrying at
+            # temperature=0 forever if the model deterministically repeats garbage.
+            level.consecutive_empty_plans += 1
+            self.logger.log_event("vlm_invalid", {"mode": mode.value, "raw_excerpt": "empty_or_unparseable", "consecutive_empty": level.consecutive_empty_plans})
             self._record_vlm_io(request, raw_response, result, mode=mode.value, call=call, parse_status=parse_status, context=call_context)
             return None
         if result.mode == "INVALID":
@@ -2995,8 +4210,13 @@ class MyAgent(_BaseAgent):
                 self.logger.log_event("vlm_invalid", {"mode": mode.value, "raw_excerpt": _short(result.raw_invalid_excerpt or "salvaged_invalid_json", 700), "salvaged": True})
             else:
                 parse_status = "invalid_schema_echo" if schema_echo_invalid else "invalid"
+                # Same rationale as the `result is None` branch above: an
+                # unsalvageable INVALID response must count toward
+                # consecutive_empty_plans or repeated non-JSON rambling at
+                # temperature=0 (observed on ls20-9607627b) never escalates temperature.
+                level.consecutive_empty_plans += 1
                 level.notes_for_next_call = _short(f"Invalid VLM output excerpt: {result.raw_invalid_excerpt}", 700)
-                self.logger.log_event("vlm_invalid", {"mode": mode.value, "raw_excerpt": result.raw_invalid_excerpt, "schema_echo": schema_echo_invalid})
+                self.logger.log_event("vlm_invalid", {"mode": mode.value, "raw_excerpt": result.raw_invalid_excerpt, "schema_echo": schema_echo_invalid, "consecutive_empty": level.consecutive_empty_plans})
                 self._record_vlm_io(request, raw_response, result, mode=mode.value, call=call, parse_status=parse_status, context=call_context)
                 return result
         else:
@@ -3007,6 +4227,30 @@ class MyAgent(_BaseAgent):
         self._apply_vlm_result(result, scene, legal)
         self._record_vlm_io(request, raw_response, result, mode=mode.value, call=call, parse_status=parse_status, context=call_context)
         self.logger.log_event("vlm_result_v20", {"mode": mode.value, "plan_steps": len(result.plan), "role_bindings": result.role_bindings, "has_win_update": bool(result.win_condition_update)})
+        # 空计划纠正：活局中“可解析但无 plan”的回答（常见于误判已通关/建议重置的
+        # 幻觉）浪费了一次预算。V2.0 契约禁止同回合二次调用，因此不当场重试，而是把
+        # 强纠正反馈写进 rejected_vlm_plan_feedback + notes，让下一次按节奏的调用以
+        # temperature=0 带着反驳重问（见 _vlm_temperature 对 empty_plan 的特判）。
+        if mode != VLMMode.SUCCESS_REFLECT:
+            if result.plan:
+                level.consecutive_empty_plans = 0
+            elif parse_status in {"parsed", "salvaged"}:
+                level.consecutive_empty_plans += 1
+                self._record_vlm_plan_rejections(
+                    "empty_plan",
+                    [{"reason": "empty_plan_for_live_level", "step": {"purpose": "response contained no executable plan"}}],
+                    0,
+                    0,
+                )
+                level.notes_for_next_call = _short(
+                    "Your previous response contained NO executable plan. This level is LIVE and NOT complete (it did not advance); if a game over happened the game was already reset. An empty plan is invalid: return 1-6 concrete executable steps (probe_action/action_sequence/click with x,y) now. "
+                    + (level.notes_for_next_call or ""),
+                    700,
+                )
+                self.logger.log_event("vlm_empty_plan_feedback_v20", {"level": level.level_index, "mode": mode.value, "call": call, "consecutive_empty": level.consecutive_empty_plans})
+                # Empty plans were a diagnostic blind spot: flush this call's raw IO
+                # so we can tell "model returned no plan" from "JSON truncated".
+                self._flush_last_vlm_io("empty_plan")
         return result
 
     def _salvage_vlm_text(self, text: str, mode: str) -> V20VLMResult | None:
@@ -3043,14 +4287,22 @@ class MyAgent(_BaseAgent):
         payload = {
             "task": "Return a short executable plan using state-action-outcome evidence. Prefer progress over conserving step count, but do not waste counter/lives on known no-ops.",
             "arc_action_reference": {
-                "RESET": "Start/restart. Do not use unless terminal or no non-reset legal action exists.",
-                "ACTION1-ACTION5-ACTION7": "Simple actions; meaning varies by game. ACTION7 is often undo/back and should be avoided unless positive local evidence proves it is needed.",
-                "ACTION6": "Coordinate click/select requiring x,y. Use click_hint fields; center-only clicking may be insufficient.",
+                **V20_ARC_ACTION_REFERENCE,
                 "transform_warning": "If an action changes patterns/objects without simple actor translation, treat it as transform/control, not navigation movement.",
             },
             "mode": mode,
             "game_id": self._game_id(),
+            "episode_state": {
+                "state": "ACTIVE",
+                "attempt_index": level.attempt_index,
+                "note": (
+                    "A previous attempt ended in GAME_OVER and the game was ALREADY reset; this is a live fresh attempt. Never request RESET and never return an empty plan."
+                    if level.attempt_index > 0
+                    else "Live game. Never request RESET and never return an empty plan."
+                ),
+            },
             "image_order": ["CURRENT_RAW", "CURRENT_ANNOTATED"] if transition is None else ["BEFORE_RAW", "CURRENT_RAW", "CURRENT_ANNOTATED"],
+            "game_action_space": [f"ACTION{v}" for v in self.memory.game.game_action_space] or None,
             "legal_actions_now": legal_names,
             "observer": {
                 "scene_summary": scene.summary[:5600],
@@ -3062,17 +4314,17 @@ class MyAgent(_BaseAgent):
             "last_transition": transition_payload,
             "game_memory": self.memory.game.as_prompt(),
             "level_memory": level.as_prompt(scene),
+            # Only genuinely new information lives here. quarantine-by-state,
+            # resource_crisis, transform_pressure, click_noops/success_by_object,
+            # click_success_coords/regions and terminal_bad_action_suffixes are
+            # already sent once inside level_memory (LevelMemoryV20.as_prompt); do
+            # not repeat them here, it only inflates the prompt (this game's
+            # text_prompt grew past 40k chars) without adding signal.
             "v20_policy_hints": {
-                "quarantine": {"state": {k[:12]: v for k, v in level.quarantine_until_by_state.get(scene.state_hash, {}).items()}, "global": dict(level.global_quarantine_until)},
+                "quarantine_global": dict(level.global_quarantine_until),
                 "avoid_action7": self.config.avoid_action7,
-                "resource_crisis": level.resource_crisis,
-                "transform_pressure": level.transform_pressure,
                 "recent_action_keys": list(level.recent_action_keys),
-                "click_noops_by_object": dict(level.click_noops_by_object),
-                "click_success_by_object": dict(level.click_success_by_object),
-                "click_success_coords": dict(level.click_success_coords.most_common(12)),
-                "click_success_regions": dict(level.click_success_regions.most_common(8)),
-                "terminal_bad_action_suffixes": [list(s) for s in level.bad_action_suffixes[-6:]],
+                "banned_click_coords": self._banned_click_coords_for_prompt(),
             },
             "plan_contract": {
                 "allowed_route_reasons": list(TRUSTED_ROUTE_REASONS),
@@ -3090,7 +4342,21 @@ class MyAgent(_BaseAgent):
             },
             "requirements": [
                 "Return only JSON. Do not ask for RESET unless terminal.",
-                "OUTPUT BUDGET: keep the whole JSON under 1200 tokens. Put plan first. Keep every meaning_nl under 40 characters. Never quote transition deltas or pattern strings verbatim. Prefer short labels over long descriptions so the JSON is never cut off.",
+                "OUTPUT BUDGET: keep the whole JSON under 1200 tokens. Put plan first. The plan is the one part you must NEVER shorten to save tokens: when budget is tight, omit action_meaning_updates/object_effect_updates/mechanics_updates instead of dropping plan steps. Keep every meaning_nl under 40 characters. Never quote transition deltas or pattern strings verbatim.",
+                "VLM calls are budgeted per level. Whenever evidence justifies more than one action, return the full 2-6 action route in ONE response (action_sequence with route_reason, or multiple plan steps, or coordinate_sequence). Do not return a single-action plan when a longer justified route exists. HARD LIMIT: never put more than 8 actions in one action_sequence; long repetition wastes the output budget and gets truncated.",
+                "Never propose coordinates listed in v20_policy_hints.banned_click_coords; pick a different object/region instead of repeating a banned click.",
+                "A level is complete ONLY when the level actually advances. If you believe the goal is met but the level did not advance, your win-condition hypothesis is WRONG: revise it and return a new executable plan. Never return an empty plan for a live level.",
+            ] + ([
+                "FUEL GAME: the step counter drops by 1 on EVERY action and hitting 0 costs a life and teleports the actor back to spawn. Single-action probe plans waste fuel. Movement vectors are already confirmed in game_memory.action_meanings: compute the route arithmetically (steps_x = |dx|/|vector_x|, steps_y = |dy|/|vector_y|) and return the COMPLETE action_sequence to the current target with route_reason=geometry.",
+            ] if level.counter_is_step_tax else []) + ([
+                "COUNTER CRITICALLY LOW: do NOT return multi-step geometry routes. Return ONE probe_action with route_reason=mechanism_probe or selector_probe and structural_change expected_predicates; plan_executor is blocked at counter<=1.",
+            ] if self._critical_counter_blocks_plan_executor(scene) else []) + ([
+                "COUNTER IS CRITICALLY LOW: an empty plan now wastes a life. Return the shortest concrete action_sequence toward the bound target immediately, even if uncertain.",
+            ] if level.resource_crisis and not self._critical_counter_blocks_plan_executor(scene) else []) + ([
+                "This game's declared action space is small and explicitly includes ACTION7, so here ACTION7 is likely a core mechanic (confirm/cycle/use) rather than undo. If it is still untested, one evidence probe of ACTION7 is worthwhile.",
+            ] if self._action7_probe_allowed() else []) + ([
+                V20_LEVEL_INIT_SIMPLE_ACTION_HINT,
+            ] if mode == VLMMode.LEVEL_INIT.value else []) + [
                 "Use current local O-ids only inside level role_bindings/plan; game-level memory must use visual descriptors.",
                 "If ACTION7 has recent no-op/undo evidence, do not choose it as the default interaction.",
                 "LEVEL_INIT: do not assert action meanings, movement vectors, or win conditions until transition evidence exists; prefer a short probe/action_sequence with explicit uncertainty.",
@@ -3099,7 +4365,11 @@ class MyAgent(_BaseAgent):
                 "For action_sequence, route_reason must be one of plan_contract.allowed_route_reasons exactly; use selector_* only for cycling/status-pattern mechanics.",
                 "Under low counter/lives, choose one high-information action rather than guard-spamming.",
                 "If a target is marked status_or_template_cue_not_move_target, do not navigate directly to it; use a reachable playfield object/waypoint or give a new mechanism hypothesis.",
+                "If a target is marked mechanism_candidate_not_move_target, it has measured transform evidence (its pattern changed) but is not currently reachable by move_to: probe/observe it via probe_action or explain how a coupled object reaches it, do not silently ignore it as decoration.",
                 "If transition evidence rejects an action as noop/transform for navigation, do not repeat it as a movement step.",
+                "Return plan as executable action contract. Prefer probe_action/action_sequence/click coordinates. Avoid move_to unless a measured movement vector exists in game_memory.",
+                "Every plan step should include expected_predicates: not_noop, no_retry, no_life_loss, and one of controlled_motion/structural_change/appeared_or_disappeared when applicable.",
+                "If recovery_contract.rejected_vlm_plan_feedback says blocked_by_transition_evidence, do not repeat the same action unless the step has allow_once_if_blocked=true and a concrete expected_predicates list.",
             ],
             "output_schema": {
                 "mode": mode,
@@ -3111,9 +4381,30 @@ class MyAgent(_BaseAgent):
                 "resource_update": {"description_nl": "<RESOURCE_LIFE_COUNTER_BEHAVIOR>", "confidence": "<0_TO_1>"},
                 "plan_goal": "<CURRENT_LEVEL_GOAL>",
                 "plan": [
-                    {"type": "probe_action", "action": "<ACTION_NAME>", "purpose": "<WHY_THIS_ACTION_IS_NEXT>", "stop_condition": "<STOP_AFTER_OBSERVABLE_CHANGE>", "max_attempts": 1},
-                    {"type": "probe_action", "action_sequence": ["<ACTION_NAME>", "<ACTION_NAME>"], "purpose": "<WHY_THIS_SEQUENCE_IS_NEXT>", "route_reason": "<EVIDENCE_FOR_THIS_ORDER>", "max_attempts": 1},
-                    {"type": "click", "action": "<CLICK_ACTION_NAME>", "x": "<X_INT>", "y": "<Y_INT>", "purpose": "<WHY_THIS_CLICK_IS_NEXT>", "stop_condition": "<STOP_AFTER_OBSERVABLE_CHANGE>", "max_attempts": 1},
+                    {"type": "probe_action", "action": "<ACTION_NAME>", "purpose": "<WHY_THIS_ACTION_IS_NEXT>", "stop_condition": "<STOP_AFTER_OBSERVABLE_CHANGE>", "expected_predicates": [{"type": "not_noop"}, {"type": "no_retry"}, {"type": "no_life_loss"}], "max_attempts": 1},
+                    {"type": "probe_action", "action_sequence": ["<ACTION_NAME>", "<ACTION_NAME>"], "purpose": "<WHY_THIS_SEQUENCE_IS_NEXT>", "route_reason": "<EVIDENCE_FOR_THIS_ORDER>", "expected_predicates": [{"type": "not_noop"}, {"type": "structural_change"}], "max_attempts": 1},
+                    {"type": "click", "action": "<CLICK_ACTION_NAME>", "x": "<X_INT>", "y": "<Y_INT>", "purpose": "<WHY_THIS_CLICK_IS_NEXT>", "stop_condition": "<STOP_AFTER_OBSERVABLE_CHANGE>", "expected_predicates": [{"type": "not_noop"}, {"type": "no_retry"}], "max_attempts": 1},
+                ],
+                "steps": [
+                    {
+                        "type": "probe_action",
+                        "action": "<ACTION_NAME>",
+                        "purpose": "<WHY_THIS_ACTION_IS_NEXT>",
+                        "route_reason": "geometry|selector_probe|selector_calibration|selector_cycle_learn|selector_pattern_rule|mechanism_probe|resource_recovery",
+                        "expected_predicates": [{"type": "not_noop"}, {"type": "no_retry"}, {"type": "no_life_loss"}, {"type": "structural_change"}],
+                        "allow_once_if_blocked": False,
+                        "max_attempts": 1,
+                    },
+                    {
+                        "type": "click",
+                        "action": "<CLICK_ACTION_NAME>",
+                        "x": "<X_INT>",
+                        "y": "<Y_INT>",
+                        "coordinate_sequence": [["<X_INT>", "<Y_INT>"]],
+                        "purpose": "<WHY_THIS_CLICK_IS_NEXT>",
+                        "expected_predicates": [{"type": "not_noop"}, {"type": "no_retry"}],
+                        "max_attempts": 1,
+                    },
                 ],
                 "bottleneck_analysis": "",
                 "notes_for_next_call": "",
@@ -3142,9 +4433,9 @@ class MyAgent(_BaseAgent):
                     "For transform-heavy states, return a short ordered action_sequence, not movement labels.",
                 ],
                 "valid_plan_shapes": [
-                    {"type": "probe_action", "action": "<ACTION_NAME>", "purpose": "<WHY_THIS_ACTION_IS_NEXT>"},
-                    {"type": "probe_action", "action_sequence": ["<ACTION_NAME>", "<ACTION_NAME>"], "purpose": "<WHY_THIS_SEQUENCE_IS_NEXT>", "route_reason": "<EVIDENCE_FOR_THIS_ORDER>"},
-                    {"type": "click", "action": "<CLICK_ACTION_NAME>", "coordinate_sequence": [["<X_INT>", "<Y_INT>"], ["<X_INT>", "<Y_INT>"]], "purpose": "<WHY_THIS_CLICK_IS_NEXT>"},
+                    {"type": "probe_action", "action": "<ACTION_NAME>", "purpose": "<WHY_THIS_ACTION_IS_NEXT>", "expected_predicates": [{"type": "not_noop"}, {"type": "no_retry"}]},
+                    {"type": "probe_action", "action_sequence": ["<ACTION_NAME>", "<ACTION_NAME>"], "purpose": "<WHY_THIS_SEQUENCE_IS_NEXT>", "route_reason": "<EVIDENCE_FOR_THIS_ORDER>", "expected_predicates": [{"type": "structural_change"}]},
+                    {"type": "click", "action": "<CLICK_ACTION_NAME>", "coordinate_sequence": [["<X_INT>", "<Y_INT>"], ["<X_INT>", "<Y_INT>"]], "purpose": "<WHY_THIS_CLICK_IS_NEXT>", "expected_predicates": [{"type": "not_noop"}]},
                 ],
             }
             payload["requirements"].extend([
@@ -3154,11 +4445,46 @@ class MyAgent(_BaseAgent):
                 "Use coordinate_sequence or explicit x,y for click-only recovery; do not rely on center-only click_hint.",
             ])
             payload["output_schema"]["plan"] = payload["recovery_contract"]["valid_plan_shapes"]
-        if len(level.recent_state_hashes) >= 6 and state_visits and max(state_visits.values()) >= 3:
-            payload["loop_warning"] = {"repeated_states": {k[:12]: v for k, v in state_visits.items() if v >= 3}, "advice": "Do not clear no-op evidence; propose a genuinely different action/target/coordinate."}
+        loop_active, _, loop_reason = self._unproductive_state_loop_signal(scene)
+        if loop_active:
+            payload["loop_warning"] = {
+                "reason": loop_reason,
+                "repeated_states": {k[:12]: v for k, v in state_visits.items() if v >= 2},
+                "advice": "Recent transitions were mostly no-op/retry while revisiting the same states. Propose a genuinely different action/target/coordinate; do not repeat the same probe.",
+            }
+        if self._transform_cycle_bottleneck_active(level) or self._mechanism_hypothesis_locked():
+            payload["transform_cycle_contract"] = {
+                "active": True,
+                "reason": level.bottleneck_reason,
+                "locked_for_level": self._mechanism_hypothesis_locked(),
+                "selector_pair_objects": sorted(level.selector_pair_object_ids),
+                "advice": (
+                    "Recent actions cycled transform states without progress. "
+                    "Do NOT return route_reason=geometry or coupled_carrier_geometry. "
+                    "Return a short selector_probe/mechanism_probe action_sequence that tests "
+                    "how the selector frame changes the status frame inner_pattern relative to the goal glyph."
+                ),
+            }
+            payload["requirements"].extend([
+                "TRANSFORM STATE CYCLE: geometry/coupled_carrier_geometry routes are rejected. Use selector_probe, selector_cycle_learn, or mechanism_probe with expected_predicates including structural_change.",
+                "Bind role_bindings when possible: selector_frame=small cycling frame, status_template_frame=corner pattern frame, actor=controlled block, target_glyph=goal glyph.",
+            ] + ([
+                "This ban persists for the rest of the level (it survives a game-over reset): do not retry geometry/coupled_carrier_geometry routes even in a fresh attempt.",
+            ] if self._mechanism_hypothesis_locked() else []))
         if extra:
             payload.update(extra)
         return json.dumps(payload, ensure_ascii=True, default=str)
+
+    def _banned_click_coords_for_prompt(self) -> list[str]:
+        level = self.memory.level
+        banned: dict[str, bool] = {}
+        for key in level.global_forbidden_click_coords:
+            banned[key] = True
+        hard_cap = self.config.max_clicks_per_coord_total * 3
+        for key, count in level.click_coord_counts.most_common(24):
+            if count >= hard_cap:
+                banned[str(key)] = True
+        return sorted(banned)[:16]
 
     def _prompt_objects(self, scene: SceneSnapshot) -> list[ObjectObservation]:
         limit = max(1, int(self.config.max_prompt_objects))
@@ -3202,8 +4528,22 @@ class MyAgent(_BaseAgent):
             nav_candidate = True
             role_hint = "controlled_actor"
         else:
-            nav_candidate = self._is_navigable_target(scene, obj) if actor_id else self._looks_like_playfield_object(scene, obj)
-            role_hint = "playfield_navigation_candidate" if nav_candidate else "status_or_template_cue_not_move_target"
+            if self._is_possible_selector_pair_object(scene, obj):
+                # V2.4: weak pre-label from template_relations before first transform.
+                nav_candidate = False
+                role_hint = "mechanism_candidate_not_move_target"
+            else:
+                nav_candidate = self._is_navigable_target(scene, obj) if actor_id else self._looks_like_playfield_object(scene, obj)
+                if nav_candidate:
+                    role_hint = "playfield_navigation_candidate"
+                elif obj.track_id in self.memory.level.mechanism_evidence_object_ids:
+                    # V2.3: distinct from plain decoration - this object has measured
+                    # transform evidence but is not (yet) reachable by move_to. Tell the
+                    # VLM to test/observe it via probe_action instead of silently
+                    # bucketing it with HUD/template cues it should never touch.
+                    role_hint = "mechanism_candidate_not_move_target"
+                else:
+                    role_hint = "status_or_template_cue_not_move_target"
         return {"id": obj.track_id, "descriptor": _json_safe(self._visual_descriptor(obj, scene)), "bbox": obj.bbox, "centroid": obj.centroid, "area": obj.area, "salience": round(obj.salience, 3), "navigation_candidate": nav_candidate, "role_hint": role_hint, "click_points_sample": points}
 
     def _visual_descriptor(self, obj: ObjectObservation, scene: SceneSnapshot | None = None) -> VisualDescriptor:
@@ -3225,6 +4565,8 @@ class MyAgent(_BaseAgent):
                         tags.append("exact_inner_match")
                     elif rel.get("same_shape_under_rotation"):
                         tags.append("same_shape_under_rotation")
+                    elif rel.get("possible_selector_pair"):
+                        tags.append("possible_selector_pair")
         return VisualDescriptor(obj.shape_label, list(obj.colors), {str(k): int(v) for k, v in obj.color_areas}, obj.pattern[:240], obj.inner_pattern[:240], obj.frame_color, size, sorted(set(tags)), obj.near_edge, obj.type_key)
 
     def _sanitize_game_text(self, text: str, scene: SceneSnapshot | None = None) -> str:
@@ -3255,6 +4597,24 @@ class MyAgent(_BaseAgent):
 
     def _click_only_legal(self, legal: Sequence[Any] | None) -> bool:
         return self._legal_action_name_set(legal) == {"ACTION6"}
+
+    def _initial_grounding_simple_actions(self, legal_names: set[str]) -> set[str]:
+        candidates: set[str] = set()
+        for name in legal_names:
+            action = _short(name, 40).upper()
+            if action == "ACTION6" or not re.fullmatch(r"ACTION\d+", action):
+                continue
+            if action == "ACTION7" and self.config.avoid_action7 and not self._action7_probe_allowed():
+                meaning = self.memory.game.action_meanings.get(action)
+                if not (
+                    meaning is not None
+                    and meaning.positive_count > 0
+                    and meaning.noop_ratio < 0.5
+                    and meaning.kind != "undo"
+                ):
+                    continue
+            candidates.add(action)
+        return candidates
 
     def _raw_plan_action_names(self, raw: dict[str, Any]) -> list[str]:
         names: list[str] = []
@@ -3316,6 +4676,8 @@ class MyAgent(_BaseAgent):
         if not recovery_active or not self._raw_plan_has_execution_evidence(raw):
             return False
         meaning = self.memory.game.action_meanings.get(action)
+        if meaning is not None and meaning.transforms + meaning.interactions > 0 and meaning.life_losses == 0 and meaning.retries == 0:
+            return True
         if meaning is not None and meaning.kind == "resource_wasting_noop" and meaning.positive_count == 0:
             return False
         if action == "ACTION7" and self.config.avoid_action7:
@@ -3347,7 +4709,7 @@ class MyAgent(_BaseAgent):
                 return "recovery_requires_action_sequence"
 
         click_intent = step_type == "click" or "ACTION6" in actions
-        simple_nonclick_legal = any(name != "ACTION6" and re.fullmatch(r"ACTION\d+", name) for name in legal_names)
+        simple_nonclick_legal = bool(self._initial_grounding_simple_actions(legal_names))
         click_evidence_seen = bool(
             self.memory.level.click_success_by_object
             or self.memory.level.click_success_coords
@@ -3444,20 +4806,43 @@ class MyAgent(_BaseAgent):
     def _apply_vlm_result(self, result: V20VLMResult, scene: SceneSnapshot, legal: Sequence[Any] | None = None) -> None:
         level = self.memory.level
         valid_ids = {o.track_id for o in scene.objects}
-        movement_rejected_actions: set[str] = set()
+        actor_role_names = {"actor", "player", "controlled_object"}
+        result_has_plan = bool(result.plan)
+        deferred_actor_bindings: list[tuple[str, str]] = []
+        accepted_vlm_plan_steps = False
         for role, oid in result.role_bindings.items():
             if oid not in valid_ids:
                 continue
             role_key = _short(role, 80)
             role_l = role_key.lower()
-            if role_l in {"actor", "player", "controlled_object"} and level.controlled_object_id:
-                current_votes = level.actor_votes.get(level.controlled_object_id, 0)
-                proposed_votes = level.actor_votes.get(oid, 0)
-                if oid != level.controlled_object_id and current_votes >= 2 and proposed_votes < current_votes:
-                    self.logger.log_event("role_binding_rejected_v20", {"level": level.level_index, "role": role_key, "proposed": oid, "current": level.controlled_object_id, "reason": "actor_transition_evidence_stronger"})
+            if role_l in self._STALE_NAV_ROLE_NAMES and self._mechanism_hypothesis_locked():
+                # V2.4: ls20 regression - once escalated, the VLM kept reflexively
+                # re-proposing role_bindings={"target": "<glyph>"} even in the SAME
+                # call whose plan got vetted-rejected for route_reason=geometry. The
+                # rejected plan never reached the executor, but this binding still
+                # got written and _navigation_target_id's role_order lookup handed
+                # it straight back to deterministic_navigation/fuel_target_greedy.
+                self.logger.log_event("role_binding_rejected_v20", {"level": level.level_index, "role": role_key, "proposed": oid, "reason": "role_locked_by_mechanism_hypothesis"})
+                continue
+            if role_l in actor_role_names:
+                obj = scene.object_by_id(oid)
+                if self._mechanism_hypothesis_locked() and obj is not None and (obj.frame_color is not None or self._is_possible_selector_pair_object(scene, obj)):
+                    self.logger.log_event("role_binding_rejected_v20", {"level": level.level_index, "role": role_key, "proposed": oid, "current": level.controlled_object_id, "reason": "actor_role_points_to_mechanism_frame"})
+                    continue
+                if level.controlled_object_id:
+                    current_votes = level.actor_votes.get(level.controlled_object_id, 0)
+                    proposed_votes = level.actor_votes.get(oid, 0)
+                    if oid != level.controlled_object_id and (
+                        (current_votes >= 1 and proposed_votes <= current_votes)
+                        or (current_votes >= 2 and proposed_votes < current_votes)
+                    ):
+                        self.logger.log_event("role_binding_rejected_v20", {"level": level.level_index, "role": role_key, "proposed": oid, "current": level.controlled_object_id, "reason": "actor_transition_evidence_stronger"})
+                        continue
+                if result_has_plan and oid != level.controlled_object_id:
+                    deferred_actor_bindings.append((role_key, oid))
                     continue
             level.local_bindings[role_key] = oid
-            if role_l in {"actor", "player", "controlled_object"}:
+            if role_l in actor_role_names:
                 level.controlled_object_id = oid
         for upd in result.action_meaning_updates:
             action = _short(upd.get("action"), 40).upper()
@@ -3489,13 +4874,33 @@ class MyAgent(_BaseAgent):
                     if text and conf >= meaning.confidence - 0.15:
                         meaning.meaning_nl = text
                     continue
+                # V2.2: accept the VLM's movement claim when the local displacement
+                # votes already point the same way. In side-effect-heavy games the
+                # strict vector confirmation above never fires, and rejecting a claim
+                # that 80%+ of local observations support (re86: 84 rejections, 93%
+                # locally corroborated) kept the navigation vector channel dead.
+                dominant = _dominant_vector(meaning.vector_votes)
+                if (
+                    vlm_vec is not None
+                    and dominant is not None
+                    and dominant[1] >= 2
+                    and meaning.movements > 0
+                    and meaning.noop_ratio < 0.5
+                    and _vector_axis_signature(dominant[0]) == _vector_axis_signature(vlm_vec)
+                ):
+                    meaning.kind = "movement"
+                    meaning.vector = dominant[0]
+                    meaning.confidence = max(meaning.confidence, min(conf, 0.6))
+                    if text and conf >= meaning.confidence - 0.15:
+                        meaning.meaning_nl = text
+                    self.logger.log_event("vlm_action_update_accepted_by_votes_v20", {"level": level.level_index, "action": action, "vlm_vector": list(vlm_vec), "adopted_vector": list(dominant[0]), "votes": dominant[1], "movements": meaning.movements})
+                    continue
                 # Treat unverified VLM vectors as hypotheses only. Transition evidence is the
                 # source of truth; otherwise a single confident hallucination can overwrite a
                 # known noop/transform action (e.g. ACTION5 in ar25 or ACTION2 in ls20).
                 reason = "movement_conflicts_with_noop_evidence" if meaning.noops > 0 and meaning.movements == 0 else "unverified_movement_vector"
                 self.logger.log_event("vlm_action_update_rejected", {"level": level.level_index, "action": action, "reason": reason, "vlm_vector": list(vlm_vec) if vlm_vec else None, "attempts": meaning.attempts, "vlm_confidence": conf})
-                movement_rejected_actions.add(action)
-                self._invalidate_plan_steps("vlm_movement_update_rejected", actions={action})
+                # Do not invalidate or filter the plan from the same VLM call.
                 meaning.confidence = max(meaning.confidence, min(conf, 0.25 if meaning.attempts == 0 else 0.35))
                 if text and not meaning.meaning_nl:
                     meaning.meaning_nl = text
@@ -3514,7 +4919,7 @@ class MyAgent(_BaseAgent):
             if desc:
                 mem = self.memory.game.win_condition or WinConditionMemory()
                 conf = _clamp01(win.get("confidence", 0.0))
-                if conf >= mem.confidence - 0.08 or not mem.description_nl:
+                if conf > mem.confidence or not mem.description_nl:
                     mem.description_nl = desc
                 mem.confidence = max(mem.confidence, conf)
                 visual_roles = win.get("visual_roles") if isinstance(win.get("visual_roles"), dict) else {}
@@ -3540,9 +4945,16 @@ class MyAgent(_BaseAgent):
             self._merge_object_effect(entry)
         for claim in result.mechanics_updates:
             claim = self._sanitize_game_text(claim, scene)
-            if claim and claim not in self.memory.game.mechanics_nl:
+            if not claim:
+                continue
+            # Near-duplicate guard: the VLM restates the same mechanic with slightly
+            # different wording every few calls (ls20 prompt carried ACTION1/2
+            # semantics 4-5x), bloating every subsequent prompt.
+            norm = re.sub(r"[^a-z0-9]+", "", claim.lower())[:80]
+            existing = {re.sub(r"[^a-z0-9]+", "", c.lower())[:80] for c in self.memory.game.mechanics_nl}
+            if norm not in existing:
                 self.memory.game.mechanics_nl.append(claim)
-                self.memory.game.mechanics_nl = self.memory.game.mechanics_nl[-20:]
+                self.memory.game.mechanics_nl = self.memory.game.mechanics_nl[-12:]
         if result.resource_update:
             desc = self._sanitize_game_text(_short(result.resource_update.get("description_nl") or result.resource_update.get("claim"), 600), scene)
             if desc:
@@ -3550,45 +4962,84 @@ class MyAgent(_BaseAgent):
         if result.plan_goal:
             level.plan_goal = _short(result.plan_goal, 500)
         if result.plan:
+            old_active = level.active_step()
+            old_plan = list(level.current_plan)
+            old_cursor = level.plan_cursor
             raw_plan_steps, raw_reject_reason = self._filter_vlm_raw_plan_steps(result.plan, scene, legal)
             steps = self._plan_steps_from_vlm(raw_plan_steps, scene)
-            if movement_rejected_actions:
-                kept: list[PlanStep] = []
-                dropped = []
-                for step in steps:
-                    if step.action.upper() in movement_rejected_actions and step.step_type in {"move_to", "probe_action"} and step.action != "ACTION6":
-                        dropped.append({"reason": "movement_update_rejected", "step": step.as_prompt()})
-                        continue
-                    kept.append(step)
-                if dropped:
-                    self.logger.log_event("vlm_plan_steps_rejected_v20", {"level": level.level_index, "reason": "movement_update_rejected", "actions": sorted(movement_rejected_actions), "dropped": dropped[:6]})
-                    self._record_vlm_plan_rejections("movement_update_rejected", dropped, len(kept), len(steps))
-                steps = kept
             steps = self._vet_vlm_plan_steps(steps, scene)
-            preserve_seed_plan = bool(
+            accepted_vlm_plan_steps = bool(steps)
+            preserve_existing_plan = bool(
                 not steps
-                and result.mode == VLMMode.LEVEL_INIT.value
-                and raw_reject_reason == "initial_click_deferred_until_simple_actions_grounded"
-                and level.active_step() is not None
+                and old_active is not None
+                and level.fuel_nav_delegated_at != level.total_action_count
+                and level.bottleneck_reason not in {
+                    "plan_step_noop",
+                    "plan_step_caused_retry_or_life_loss",
+                    "life_loss_detected",
+                    "critical_resource_counter",
+                    "game_over",
+                }
             )
-            if preserve_seed_plan:
-                level.bottleneck_reason = ""
-                level.action_recovery_contract = False
-                self.logger.log_event("vlm_plan_preserved_seed_v20", {"level": level.level_index, "reason": raw_reject_reason, "seed_steps": len(level.current_plan)})
+            if preserve_existing_plan:
+                level.current_plan = old_plan
+                level.plan_cursor = old_cursor
+                if raw_reject_reason == "initial_click_deferred_until_simple_actions_grounded":
+                    level.bottleneck_reason = ""
+                    level.action_recovery_contract = False
+                    self.logger.log_event("vlm_plan_preserved_seed_v20", {"level": level.level_index, "reason": raw_reject_reason, "seed_steps": len(level.current_plan)})
+                else:
+                    level.bottleneck_reason = raw_reject_reason or level.bottleneck_reason or "vlm_zero_step_preserved_existing_plan"
+                    level.action_recovery_contract = True
+                    self.logger.log_event(
+                        "vlm_plan_preserved_existing_v20",
+                        {
+                            "level": level.level_index,
+                            "reason": raw_reject_reason,
+                            "existing_remaining": len(level.current_plan[level.plan_cursor:]),
+                        },
+                    )
             else:
                 level.current_plan = steps
                 level.plan_cursor = 0
                 if steps:
                     level.bottleneck_reason = ""
                     level.action_recovery_contract = False
+                    level.fallback_guard_block_until = 0
+                elif level.fuel_nav_delegated_at == level.total_action_count:
+                    # The lone movement step was handed to the local navigator on
+                    # purpose; this is a successful handoff, not a planning failure.
+                    level.bottleneck_reason = ""
+                    level.action_recovery_contract = False
                 else:
                     level.bottleneck_reason = raw_reject_reason or level.bottleneck_reason or "vlm_unusable_plan"
                     level.action_recovery_contract = True
+                    level.fallback_guard_block_until = max(level.fallback_guard_block_until, level.total_action_count + 1)
+                    if not steps and self._transform_cycle_bottleneck_active(level):
+                        self._maybe_escalate_mechanism_hypothesis(scene, "vlm_empty_plan_in_cycle")
         elif result.mode in {VLMMode.BOTTLENECK.value, VLMMode.EVALUATE_CHUNK.value}:
-            level.current_plan = []
-            level.plan_cursor = 0
+            old_active = level.active_step()
+            hard_clear_reasons = {
+                "plan_step_noop",
+                "plan_step_caused_retry_or_life_loss",
+                "life_loss_detected",
+                "critical_resource_counter",
+                "game_over",
+            }
+            if old_active is None or level.bottleneck_reason in hard_clear_reasons:
+                level.current_plan = []
+                level.plan_cursor = 0
             level.bottleneck_reason = level.bottleneck_reason or "vlm_empty_plan"
             level.action_recovery_contract = True
+            level.fallback_guard_block_until = max(level.fallback_guard_block_until, level.total_action_count + 1)
+        if deferred_actor_bindings:
+            if accepted_vlm_plan_steps:
+                for role_key, oid in deferred_actor_bindings:
+                    level.local_bindings[role_key] = oid
+                    level.controlled_object_id = oid
+            else:
+                for role_key, oid in deferred_actor_bindings:
+                    self.logger.log_event("role_binding_rejected_v20", {"level": level.level_index, "role": role_key, "proposed": oid, "current": level.controlled_object_id, "reason": "actor_binding_deferred_until_executable_plan"})
         if result.bottleneck_analysis:
             level.notes_for_next_call = _short(result.bottleneck_analysis, 700)
         if result.notes_for_next_call:
@@ -3600,12 +5051,28 @@ class MyAgent(_BaseAgent):
         if not isinstance(step.raw, dict):
             return False
         route_reason = _short(step.raw.get("route_reason"), 80)
+        if (self._transform_cycle_bottleneck_active() or self._mechanism_hypothesis_locked()) and route_reason in {"geometry", "coupled_carrier_geometry"}:
+            return False
         trusted_route = route_reason in TRUSTED_ROUTE_REASONS
+        action = (action_name_raw or step.action).upper()
+        if route_reason == "mechanism_probe":
+            meaning = self.memory.game.action_meanings.get(action)
+            if meaning is None or meaning.life_losses > 0 or meaning.retries > 0 or not step.expected_predicates:
+                return False
+            measured_movement = (
+                meaning.kind == "movement"
+                and meaning.vector is not None
+                and meaning.movements >= 1
+                and meaning.noop_ratio < 0.35
+            )
+            observed_mechanism = meaning.transforms + meaning.interactions > 0
+            return bool(measured_movement or observed_mechanism)
+        if route_reason == "resource_recovery":
+            return bool(step.expected_predicates and self.memory.level.resource_crisis)
         if "sequence_index" not in step.raw:
             return bool(trusted_route and step.step_type == "probe_action" and (action_name_raw or step.action))
         if trusted_route:
             return True
-        action = (action_name_raw or step.action).upper()
         meaning = self.memory.game.action_meanings.get(action)
         if not meaning:
             return False
@@ -3633,7 +5100,7 @@ class MyAgent(_BaseAgent):
         raw = step.raw if isinstance(step.raw, dict) else {}
         coords = self._iter_raw_click_coordinates(raw)
         if coords:
-            return any(
+            if any(
                 0 <= x < scene.width
                 and 0 <= y < scene.height
                 and not self._action_blocked(
@@ -3643,7 +5110,17 @@ class MyAgent(_BaseAgent):
                     ignore_click_exhaustion=self._click_key_has_positive_evidence(f"ACTION6:{x},{y}"),
                 )
                 for x, y in coords
-            )
+            ):
+                return True
+            # All explicit coordinates are exhausted/banned. Only remap to a
+            # coordinate backed by positive click evidence; broad local remaps make
+            # VLM failures look executable and caused click-only games to sweep the grid.
+            blocked = set(self.memory.level.known_noops_by_state.get(scene.state_hash, set())) | set(self.memory.level.tried_actions_by_state.get(scene.state_hash, set()))
+            if self._focused_action6_target(scene, blocked) is not None:
+                if isinstance(step.raw, dict):
+                    step.raw = {**step.raw, "click_coords_exhausted_remap": True}
+                return True
+            return False
         target_id = self._resolve_step_target(step)
         target = scene.object_by_id(target_id) if target_id else None
         if target is None:
@@ -3653,9 +5130,46 @@ class MyAgent(_BaseAgent):
             return False
         return self._next_click_point_for_object(scene, target, hint=_short(raw.get("click_hint") or raw.get("click_point") or "", 40).lower()) is not None
 
+    def _geometry_plan_chases_selector_pair_without_waypoint(self, step: PlanStep, scene: SceneSnapshot, route_reason: str) -> bool:
+        if route_reason != "geometry":
+            return False
+        raw = step.raw if isinstance(step.raw, dict) else {}
+        waypoint_keys = ("route_waypoint", "route_waypoints", "waypoint", "waypoint_object_id", "via", "via_object_id")
+        if any(_short(raw.get(key), 80) for key in waypoint_keys):
+            return False
+
+        texts = [step.purpose, step.stop_condition]
+        for key in ("purpose", "why", "route_to", "target", "target_id", "target_object_id", "object_id", "expected_change", "stop_condition", "evidence"):
+            value = raw.get(key)
+            if isinstance(value, str):
+                texts.append(value)
+        for key in ("actions", "action_sequence", "probe_actions"):
+            sequence = raw.get(key)
+            if not isinstance(sequence, list):
+                continue
+            for item in sequence:
+                if not isinstance(item, dict):
+                    continue
+                for subkey in ("purpose", "why", "target", "target_id", "target_object_id", "object_id", "expected_change", "stop_condition", "evidence"):
+                    value = item.get(subkey)
+                    if isinstance(value, str):
+                        texts.append(value)
+
+        mentioned_ids = {oid for text in texts for oid in re.findall(r"\bO\d+\b", _short(text, 1000).upper())}
+        for oid in mentioned_ids:
+            obj = scene.object_by_id(oid)
+            if obj is not None and self._is_possible_selector_pair_object(scene, obj):
+                return True
+        return False
+
     def _plan_step_rejected_reason(self, step: PlanStep, scene: SceneSnapshot) -> str:
         action = step.action.upper()
         level = self.memory.level
+        route_reason = _short(step.raw.get("route_reason"), 80) if isinstance(step.raw, dict) else ""
+        if (self._transform_cycle_bottleneck_active(level) or self._mechanism_hypothesis_locked()) and route_reason in {"geometry", "coupled_carrier_geometry"}:
+            return "transform_state_cycle_rejects_geometry_plan"
+        if self._geometry_plan_chases_selector_pair_without_waypoint(step, scene, route_reason):
+            return "geometry_to_selector_pair_mechanism_without_waypoint"
         if step.step_type in {"move_to", "interact"} and self._in_transform_mode(scene):
             return "transform_mode_rejects_navigation_plan"
         if action == "RESET":
@@ -3673,9 +5187,30 @@ class MyAgent(_BaseAgent):
                 except Exception:
                     seq_index = -1
             recovery_override = self._vlm_recovery_probe_override(step, scene, action)
-            if self._action_blocked(scene, action, ignore_recent=trusted or recovery_override, ignore_loop_quarantine=trusted or recovery_override, ignore_noop_evidence=recovery_override):
+            if self._action_blocked(
+                scene,
+                action,
+                ignore_recent=trusted or recovery_override,
+                ignore_loop_quarantine=trusted or recovery_override,
+                ignore_noop_evidence=recovery_override,
+                ignore_contract=recovery_override,
+            ):
                 if not recovery_override and not (trusted and seq_index > 0):
-                    return "blocked_by_transition_evidence"
+                    # V2.6: only persist a permanent per-state contract when the block
+                    # comes from durable evidence (noop/contract/suffix/quarantine). A
+                    # block caused solely by the 2-step repeat cooldown is transient:
+                    # in sb26 the transform controller pressed ACTION5 constantly, so
+                    # 20 VLM proposals of ACTION5 (the win-trigger action) landed in
+                    # the cooldown window and each wrote a permanent state ban.
+                    # Recheck ignores transient blocks only (repeat cooldown + loop
+                    # quarantine). Durable noop/contract/suffix evidence still writes
+                    # the permanent per-state ban. Previously ignore_loop_quarantine
+                    # was omitted here, so a temporary quarantine alone could stamp
+                    # vlm_vet forever.
+                    if self._action_blocked(scene, action, ignore_recent=True, ignore_loop_quarantine=True):
+                        self._contract_forbid_action(scene, action, "vlm_vet:blocked_by_transition_evidence")
+                        return "blocked_by_transition_evidence"
+                    return "action_repeat_cooldown"
             if not trusted and self._resource_crisis_active(scene) and self._resource_risky_nonreset_action(scene, action):
                 return "resource_risky_without_positive_evidence"
             meaning = self.memory.game.action_meanings.get(action)
@@ -3691,12 +5226,46 @@ class MyAgent(_BaseAgent):
         if not steps:
             return []
         level = self.memory.level
+        # V2.2 fuel-game delegation: in a step-tax game a lone "move once toward the
+        # target" plan burns a whole VLM round per counter tick and ping-pongs
+        # (ls20: 33/42 calls returned a single movement step, UP/DOWN alternation
+        # drained the fuel; the VLM also mixes up axes). Once movement vectors are
+        # confirmed and a navigable target is bound, the local navigator computes
+        # routes with correct geometry - drop the lone step and let it drive. Multi-
+        # step routes and non-movement steps are untouched.
+        if level.counter_is_step_tax and len(steps) == 1:
+            lone = steps[0]
+            lone_action = lone.action.upper()
+            lone_meaning = self.memory.game.action_meanings.get(lone_action)
+            learned_vectors = sum(1 for m in self.memory.game.action_meanings.values() if m.kind == "movement" and m.vector is not None and m.confidence >= 0.4)
+            nav_target = self._navigation_target_id(scene) if learned_vectors >= 2 else ""
+            if (
+                lone.step_type == "probe_action"
+                and lone_meaning is not None
+                and lone_meaning.kind == "movement"
+                and lone_meaning.vector is not None
+                and nav_target
+                and not self._trusted_plan_sequence(lone, lone_action)
+            ):
+                self.logger.log_event("fuel_single_move_delegated_v20", {"level": level.level_index, "action": lone_action, "nav_target": nav_target})
+                note = "Single-step movement plans are delegated to the local navigator in this step-counter game. Return either a FULL multi-step route (action_sequence) or just updated role_bindings/win_condition; a lone 1-step move wastes the call."
+                if note[:50] not in (level.notes_for_next_call or ""):
+                    level.notes_for_next_call = _short(note + " " + (level.notes_for_next_call or ""), 700)
+                level.fuel_nav_delegated_at = level.total_action_count
+                return []
         kept: list[PlanStep] = []
         dropped: list[dict[str, Any]] = []
         consecutive_key = ""
         consecutive_count = 0
         click_targets: Counter[str] = Counter()
         resource_active = self._resource_crisis_active(scene) or scene.counter_value is not None or scene.life_count is not None
+        # V2.3: counter at/below critical_resource_ratio means the very next noop/
+        # retry can end the attempt. TRUSTED_ROUTE_REASONS (geometry/selector_*)
+        # steps are exempt from resource_plan_max_steps below by design (routes with
+        # confirmed vectors are normally safe to commit to), but that exemption must
+        # not extend to critical fuel - ls20 call#18 kept a full 10-action trusted
+        # "geometry" route at counter=0/42 with zero chance to react mid-route.
+        counter_critical = scene.counter_ratio is not None and scene.counter_ratio <= self.config.critical_resource_ratio
         for step in steps:
             reason = self._plan_step_rejected_reason(step, scene)
             rep_key = self._plan_repetition_key(step, scene)
@@ -3722,6 +5291,11 @@ class MyAgent(_BaseAgent):
             if self._vlm_recovery_probe_override(step, scene, step.action) and isinstance(step.raw, dict):
                 step.raw = {**step.raw, "vlm_recovery_override": True}
             kept.append(step)
+            if counter_critical and len(kept) >= 1:
+                remaining = len(steps) - (len(kept) + len(dropped))
+                if remaining > 0:
+                    dropped.append({"reason": "critical_resource_plan_truncated", "remaining": remaining})
+                break
             if resource_active and not trusted_step and len(kept) >= self.config.resource_plan_max_steps:
                 remaining = len(steps) - (len(kept) + len(dropped))
                 if remaining > 0:
@@ -3730,6 +5304,12 @@ class MyAgent(_BaseAgent):
         if dropped:
             self.logger.log_event("vlm_plan_steps_rejected_v20", {"level": level.level_index, "reason": "plan_vetting", "dropped": dropped[:8], "kept": len(kept), "input": len(steps)})
             self._record_vlm_plan_rejections("plan_vetting", dropped, len(kept), len(steps))
+            if not kept and any(d.get("reason") == "geometry_to_selector_pair_mechanism_without_waypoint" for d in dropped):
+                self._maybe_escalate_mechanism_hypothesis(scene, "geometry_to_selector_pair_rejected")
+            elif not kept and any(d.get("reason") == "transform_state_cycle_rejects_geometry_plan" for d in dropped):
+                self._maybe_escalate_mechanism_hypothesis(scene, "geometry_plan_rejected_in_cycle")
+            elif not kept and self._transform_cycle_bottleneck_active(level) and level.vlm_issue_repeat_count >= 2:
+                self._maybe_escalate_mechanism_hypothesis(scene, "repeated_vlm_rejection")
         return kept
 
     def _normalize_vlm_action_kind(self, raw_kind: str, meaning: ActionMeaning) -> str:
@@ -3785,7 +5365,9 @@ class MyAgent(_BaseAgent):
                 continue
             sequence = raw.get("actions") or raw.get("action_sequence") or raw.get("probe_actions")
             if isinstance(sequence, list):
-                for idx, item in enumerate(sequence):
+                # 防御退化复读：截断后的超长 action_sequence（如 ACTION2 x60）只取前段，
+                # 否则 trusted route_reason 会绕过重复上限,把整条退化序列执行完。
+                for idx, item in enumerate(sequence[:12]):
                     if len(steps) >= self.config.max_plan_steps:
                         break
                     item_raw = dict(item) if isinstance(item, dict) else {}
@@ -3873,7 +5455,7 @@ class MyAgent(_BaseAgent):
         simple_names = simple_action_names(legal)
         special_objects = [o for o in sorted(scene.objects, key=lambda x: -self._object_interest_score(scene, x)) if not o.near_edge][:4]
         for name in simple_names:
-            if name == "ACTION7" and self.config.avoid_action7:
+            if name == "ACTION7" and self.config.avoid_action7 and not self._action7_probe_allowed():
                 continue
             m = self.memory.game.action_meanings.get(name)
             if m is None or m.confidence < 0.4:
@@ -3892,6 +5474,33 @@ class MyAgent(_BaseAgent):
 
     def _execute_next_plan_action(self, scene: SceneSnapshot, legal: Sequence[Any]) -> tuple[Any, dict[str, Any], str] | None:
         level = self.memory.level
+        if self._critical_counter_blocks_plan_executor(scene) and level.active_step() is not None:
+            # V2.4: even a 1-step trusted geometry route burns the last counter tick
+            # (ls20 step 132: critical_resource_plan_truncated kept 1 step, plan_executor
+            # ran ACTION1, counter 1->0 game over). Block executor; fall through to
+            # nonreset_guard / safe single probes instead.
+            level.current_plan = []
+            level.plan_cursor = 0
+            level.bottleneck_reason = level.bottleneck_reason or "critical_resource_counter"
+            level.action_recovery_contract = True
+            self.logger.log_event("plan_executor_blocked_critical_counter_v20", {"level": level.level_index, "counter": scene.counter_value, "ratio": scene.counter_ratio})
+            return None
+        active = level.active_step()
+        active_raw = active.raw if active is not None and isinstance(active.raw, dict) else {}
+        trusted_sequence = bool(active is not None and active.action and "sequence_index" in active_raw and self._trusted_plan_sequence(active, active.action))
+        if not trusted_sequence and (
+            self._source_storm_active("plan_executor", outcomes={"noop", "state_change", "transform", "resource_delta"})
+            or self._source_low_yield_active("plan_executor", outcomes={"noop", "state_change", "transform", "resource_delta"})
+        ):
+            dropped = {"reason": "plan_executor_low_yield", "step": active.as_prompt() if active is not None else {}}
+            level.current_plan = []
+            level.plan_cursor = 0
+            level.bottleneck_reason = "plan_executor_low_yield"
+            level.action_recovery_contract = True
+            level.fallback_guard_block_until = max(level.fallback_guard_block_until, level.total_action_count + 1)
+            self._record_vlm_plan_rejections("source_fuse", [dropped], 0, 1 if active is not None else 0)
+            self.logger.log_event("source_fuse_open_v20", {"level": level.level_index, "source": "plan_executor", "state": scene.state_hash[:12], "reason": "low_yield_plan_executor"})
+            return None
         while True:
             step = level.active_step()
             if step is None:
@@ -3945,16 +5554,31 @@ class MyAgent(_BaseAgent):
             recovery_override = self._vlm_recovery_probe_override(step, scene, name)
             ignore_recent = trusted_sequence or recovery_override
             ignore_loop_quarantine = trusted_sequence or recovery_override
-            if self._action_blocked(scene, name, ignore_recent=ignore_recent, ignore_loop_quarantine=ignore_loop_quarantine, ignore_noop_evidence=recovery_override):
+            if self._action_blocked(
+                scene,
+                name,
+                ignore_recent=ignore_recent,
+                ignore_loop_quarantine=ignore_loop_quarantine,
+                ignore_noop_evidence=recovery_override,
+                ignore_contract=recovery_override or trusted_sequence,
+            ):
                 return None
-            return {"name": name, "purpose": step.purpose or f"probe {name}", "expected_change": step.stop_condition or "learn action effect", "expected_predicates": step.expected_predicates, "ignore_recent": ignore_recent, "ignore_loop_quarantine": ignore_loop_quarantine, "ignore_noop_evidence": recovery_override, "trusted_plan_sequence": trusted_sequence, "vlm_recovery_override": recovery_override}
+            return {"name": name, "purpose": step.purpose or f"probe {name}", "expected_change": step.stop_condition or "learn action effect", "expected_predicates": step.expected_predicates, "ignore_recent": ignore_recent, "ignore_loop_quarantine": ignore_loop_quarantine, "ignore_noop_evidence": recovery_override, "ignore_contract": recovery_override or trusted_sequence, "trusted_plan_sequence": trusted_sequence, "vlm_recovery_override": recovery_override}
         if step.step_type in {"click", "probe_object"}:
             if "ACTION6" in legal_by:
                 for explicit_x, explicit_y in self._iter_raw_click_coordinates(step.raw):
                     if 0 <= explicit_x < scene.width and 0 <= explicit_y < scene.height:
                         key = f"ACTION6:{explicit_x},{explicit_y}"
                         positive_click_evidence = self._click_key_has_positive_evidence(key)
-                        if self._action_blocked(scene, key, ignore_recent=bool(step.action), ignore_click_exhaustion=positive_click_evidence):
+                        explicit_click_sequence = bool(self._iter_raw_click_coordinates(step.raw))
+                        ignore_contract = positive_click_evidence or explicit_click_sequence
+                        if self._action_blocked(
+                            scene,
+                            key,
+                            ignore_recent=bool(step.action),
+                            ignore_click_exhaustion=positive_click_evidence,
+                            ignore_contract=ignore_contract,
+                        ):
                             continue
                         return {
                             "name": "ACTION6",
@@ -3966,6 +5590,7 @@ class MyAgent(_BaseAgent):
                             "expected_predicates": step.expected_predicates,
                             "ignore_recent": bool(step.action),
                             "ignore_click_exhaustion": positive_click_evidence,
+                            "ignore_contract": ignore_contract,
                         }
                     self.logger.log_event(
                         "vlm_click_coordinate_rejected",
@@ -3986,10 +5611,18 @@ class MyAgent(_BaseAgent):
             if "ACTION6" in legal_by:
                 hint = _short(step.raw.get("click_hint") or step.raw.get("click_point") or "", 40).lower()
                 point = self._next_click_point_for_object(scene, target, hint=hint)
+                if point is None and step.raw.get("click_coords_exhausted_remap"):
+                    blocked = set(self.memory.level.known_noops_by_state.get(scene.state_hash, set())) | set(self.memory.level.tried_actions_by_state.get(scene.state_hash, set()))
+                    picked = self._focused_action6_target(scene, blocked)
+                    if picked is not None:
+                        point = (picked[0], picked[1])
                 if point is None:
                     return None
                 x, y = point
-                return {"name": "ACTION6", "x": x, "y": y, "target_object_id": target_id, "purpose": step.purpose or f"click/test {target_id}", "expected_change": step.stop_condition or "observe object response", "expected_predicates": step.expected_predicates}
+                key = f"ACTION6:{x},{y}"
+                if step.raw.get("click_coords_exhausted_remap"):
+                    self.logger.log_event("vlm_click_remapped_v20", {"level": self.memory.level.level_index, "x": x, "y": y, "target": target_id, "reason": "explicit_coordinates_exhausted"})
+                return {"name": "ACTION6", "x": x, "y": y, "target_object_id": target_id, "purpose": step.purpose or f"click/test {target_id}", "expected_change": step.stop_condition or "observe object response", "expected_predicates": step.expected_predicates, "ignore_contract": self._click_key_has_positive_evidence(key)}
             if self._target_reached(target_id, scene):
                 interact = self._best_interaction_action(scene, legal, target_id)
                 if interact:
@@ -4006,7 +5639,7 @@ class MyAgent(_BaseAgent):
         if step.step_type == "interact":
             if target is not None and not self._target_reached(target_id, scene):
                 return self._navigation_proposal_to_target(target_id, scene, legal, step)
-            name = step.action if step.action in legal_by and not self._action_blocked(scene, step.action) else self._best_interaction_action(scene, legal, target_id)
+            name = step.action if step.action in legal_by and not self._action_blocked(scene, step.action, ignore_contract=self._trusted_plan_sequence(step, step.action) or self._vlm_recovery_probe_override(step, scene, step.action)) else self._best_interaction_action(scene, legal, target_id)
             if name:
                 return {"name": name, "target_object_id": target_id, "purpose": step.purpose or f"interact with {target_id}", "expected_change": step.stop_condition or "interaction/change"}
         return None
@@ -4061,29 +5694,98 @@ class MyAgent(_BaseAgent):
         region_key = self._click_region_key_from_action_key(key)
         return bool(region_key and level.click_success_regions.get(region_key, 0) > 0)
 
-    def _action_blocked(self, scene: SceneSnapshot, name_or_key: str, *, ignore_recent: bool = False, ignore_loop_quarantine: bool = False, ignore_noop_evidence: bool = False, ignore_click_exhaustion: bool = False) -> bool:
+    def _contract_forbid_action(self, scene: SceneSnapshot, action_key: str, reason: str) -> None:
+        key = _short(action_key, 80).upper()
+        if not key or key == "RESET":
+            return
+        base = key.split(":", 1)[0]
+        rules = self.memory.level.contract_forbidden_by_state.setdefault(scene.state_hash, {})
+        rules[key] = _short(reason, 160)
+        if base != "ACTION6":
+            rules[base] = _short(reason, 160)
+        self.logger.log_event(
+            "contract_action_forbidden_v20",
+            {
+                "level": self.memory.level.level_index,
+                "state": scene.state_hash[:12],
+                "action": key,
+                "base": base,
+                "reason": _short(reason, 160),
+            },
+        )
+
+    def _contract_blocks_action(self, scene: SceneSnapshot, action_key: str) -> bool:
+        key = _short(action_key, 80).upper()
+        if not key:
+            return False
+        base = key.split(":", 1)[0]
+        rules = self.memory.level.contract_forbidden_by_state.get(scene.state_hash, {})
+        return key in rules or base in rules
+
+    def _action_blocked(self, scene: SceneSnapshot, name_or_key: str, *, ignore_recent: bool = False, ignore_loop_quarantine: bool = False, ignore_noop_evidence: bool = False, ignore_click_exhaustion: bool = False, ignore_contract: bool = False, ignore_defer: bool = False) -> bool:
         level = self.memory.level
         now = level.total_action_count
         key = name_or_key.upper()
         base_name = key.split(":", 1)[0]
         if base_name == "RESET":
             return True
-        if base_name == "ACTION6" and ":" in key and not ignore_click_exhaustion:
-            if level.click_coord_counts.get(key, 0) >= self.config.max_clicks_per_coord_total:
-                return True
+        # V2.1 hard, state-independent ban for churn-fused click coordinates. Must NOT be
+        # bypassable by ignore_contract / ignore_click_exhaustion (which VLM explicit
+        # coordinate plans set), otherwise ft09-style click loops immediately re-open.
+        if base_name == "ACTION6" and ":" in key and key in level.global_forbidden_click_coords:
+            return True
+        if not ignore_contract and self._contract_blocks_action(scene, key):
+            return True
+        if base_name == "ACTION6" and ":" in key:
+            coord_count = level.click_coord_counts.get(key, 0)
             region_key = self._click_region_key_from_action_key(key)
-            if region_key and level.click_region_counts.get(region_key, 0) >= self.config.max_clicks_per_region_total:
+            region_count = level.click_region_counts.get(region_key, 0) if region_key else 0
+            if not ignore_click_exhaustion:
+                if coord_count >= self.config.max_clicks_per_coord_total:
+                    return True
+                if region_key and region_count >= self.config.max_clicks_per_region_total:
+                    return True
+            # Hard ceiling that positive-evidence / explicit-VLM coords cannot bypass.
+            # Games like ft09 recolor neighbours so every click yields a fresh state
+            # hash; revisit-based churn checks then never fire, letting a single
+            # coordinate be spammed. Cap absolute repeats per coordinate/region anyway.
+            if coord_count >= self.config.max_clicks_per_coord_total * 3:
                 return True
-        if base_name == "ACTION6" and self._defer_unproven_click_action(scene):
+            if region_key and region_count >= self.config.max_clicks_per_region_total * 2:
+                return True
+        if base_name == "ACTION6" and not ignore_defer and self._defer_unproven_click_action(scene):
             return True
         if base_name != "ACTION6":
             meaning = self.memory.game.action_meanings.get(base_name)
-            if meaning is not None and meaning.kind == "resource_wasting_noop" and meaning.movements == 0:
+            # V2.7: resource_wasting_noop is a strong prior, but if recent presses of
+            # this action still open never-seen states, keep it available for
+            # confirm/transform probes (sb26 ACTION5 was permanently hard-blocked
+            # after early pre-selection presses looked like a tiny status ticker).
+            if (
+                meaning is not None
+                and meaning.kind == "resource_wasting_noop"
+                and meaning.movements == 0
+                and self._action_recent_novel_state_yield(base_name) == 0
+            ):
                 return True
-            if self._defer_unproven_nonmovement_action(scene, base_name):
+            if not ignore_defer and self._defer_unproven_nonmovement_action(scene, base_name):
                 return True
         if self._would_repeat_terminal_suffix(key):
             return True
+        # V2.2 hard, non-bypassable block: an action whose back-to-back spam ended
+        # >=2 attempts (and >=half of all deaths) is lethal regardless of state
+        # hash. bp35 died 10x to ACTION3 runs because plan_executor's
+        # ignore_contract kept re-opening it in fresh states. Requiring the last
+        # TWO presses to match keeps coincidental "last key before a timer death"
+        # (tu93 dies every 50 steps no matter what) from banning movement keys.
+        if base_name != "ACTION6" and len(level.bad_action_suffixes) >= 2:
+            terminal_hits = sum(
+                1
+                for s in level.bad_action_suffixes
+                if len(s) >= 2 and s[-1].split(":", 1)[0] == base_name and s[-2].split(":", 1)[0] == base_name
+            )
+            if terminal_hits >= 2 and terminal_hits * 2 >= len(level.bad_action_suffixes):
+                return True
         if not ignore_noop_evidence and key in level.known_noops_by_state.get(scene.state_hash, set()):
             return True
         if not ignore_loop_quarantine:
@@ -4096,7 +5798,7 @@ class MyAgent(_BaseAgent):
             counts = level.action_outcomes.get(base_name, Counter())
             if counts.get("noop", 0) >= self.config.action7_noop_quarantine_after and counts.get("interaction", 0) + counts.get("transform", 0) == 0:
                 return True
-            if meaning is None or meaning.kind not in {"interact_or_transform", "resource"} or meaning.noop_ratio >= 0.5 or meaning.kind == "undo":
+            if (meaning is None or meaning.kind not in {"interact_or_transform", "resource"} or meaning.noop_ratio >= 0.5 or meaning.kind == "undo") and not self._action7_probe_allowed():
                 return True
         if not ignore_recent and self.config.action_repeat_cooldown > 0:
             recent = list(level.recent_action_keys)[-self.config.action_repeat_cooldown:]
@@ -4224,9 +5926,13 @@ class MyAgent(_BaseAgent):
     def _recent_transform_pressure_active(self) -> bool:
         level = self.memory.level
         recent = list(level.recent_events)[-8:]
-        transforms = sum(1 for e in recent if e.outcome == "transform")
-        movements = sum(1 for e in recent if e.outcome == "movement")
+        transforms = sum(1 for e in recent if e.outcome in {"transform", "movement_with_transform"})
+        movements = sum(1 for e in recent if e.outcome in {"movement", "movement_with_transform"})
         return transforms >= self.config.transform_mode_threshold and transforms >= movements
+
+    def _transform_bottleneck_active(self) -> bool:
+        level = self.memory.level
+        return level.repeated_transform_streak >= self.config.transform_mode_threshold or self._recent_transform_pressure_active()
 
     def _in_transform_mode(self, scene: SceneSnapshot) -> bool:
         level = self.memory.level
@@ -4243,12 +5949,28 @@ class MyAgent(_BaseAgent):
         legal_names = {action_name(a).upper() for a in legal}
         vectors: dict[str, tuple[int, int]] = {}
         for name, m in self.memory.game.action_meanings.items():
-            if name in legal_names and m.vector is not None and m.kind == "movement" and m.confidence >= 0.4 and m.noop_ratio < 0.7:
+            if (
+                name in legal_names
+                and m.vector is not None
+                and m.kind == "movement"
+                and m.movements >= 2
+                and m.confidence >= 0.55
+                and m.noop_ratio < 0.35
+                and m.transforms <= m.movements
+            ):
                 vectors[name] = m.vector
         weak = {"ACTION1": (0, -actor.height), "ACTION2": (0, actor.height), "ACTION3": (-actor.width, 0), "ACTION4": (actor.width, 0)}
         for name, vec in weak.items():
             m = self.memory.game.action_meanings.get(name)
-            if name in legal_names and name not in vectors and (m is None or (m.kind not in {"interact_or_transform", "undo"} and m.noop_ratio < 0.7)):
+            if name in legal_names and name not in vectors and (
+                m is None
+                or (
+                    m.kind not in {"interact_or_transform", "undo", "resource_wasting_noop"}
+                    and m.transforms == 0
+                    and m.interactions == 0
+                    and m.noop_ratio < 0.35
+                )
+            ):
                 vectors[name] = vec
         return vectors
 
@@ -4330,8 +6052,6 @@ class MyAgent(_BaseAgent):
         actor = scene.object_by_id(level.controlled_object_id)
         legal_names = {action_name(a).upper() for a in legal}
         learned_vectors = [name for name, meaning in self.memory.game.action_meanings.items() if name in legal_names and meaning.vector is not None and meaning.kind == "movement" and meaning.confidence >= 0.4]
-        if level.bottleneck_reason and self._vlm_available() and level.vlm_calls_this_level < self.config.max_vlm_calls_per_level:
-            return None
         if actor is None or len(learned_vectors) < 2:
             return None
         target_id = self._navigation_target_id(scene)
@@ -4414,10 +6134,13 @@ class MyAgent(_BaseAgent):
             return False
         if target.track_id == actor.track_id:
             return True
+        if self._is_possible_selector_pair_object(scene, target):
+            self._note_navigation_target_rejected(target, "selector_pair_mechanism_object", {"level": self.memory.level.level_index, "target": target.track_id, "reason": "selector_pair_mechanism_object"})
+            return False
         motion_region = self._actor_motion_region_bbox(scene, actor)
         if self._looks_like_nonplayfield_status_cue(scene, target, actor=actor):
             if motion_region is None or not self._bbox_intersects_with_margin(target.bbox, motion_region, 3):
-                self.logger.log_event("navigation_target_rejected", {"level": self.memory.level.level_index, "target": target.track_id, "target_bbox": target.bbox, "actor": actor.track_id, "actor_motion_region": motion_region, "reason": "status_or_template_cue"})
+                self._note_navigation_target_rejected(target, "status_or_template_cue", {"level": self.memory.level.level_index, "target": target.track_id, "target_bbox": target.bbox, "actor": actor.track_id, "actor_motion_region": motion_region, "reason": "status_or_template_cue"})
                 return False
         region = self._actor_floor_region_bbox(scene, actor)
         if region is None:
@@ -4427,8 +6150,28 @@ class MyAgent(_BaseAgent):
             self.logger.log_event("navigation_target_allowed_by_vector", {"level": self.memory.level.level_index, "target": target.track_id, "target_bbox": target.bbox, "actor": actor.track_id, "actor_floor_region": region})
             return True
         if not intersects:
-            self.logger.log_event("navigation_target_rejected", {"level": self.memory.level.level_index, "target": target.track_id, "target_bbox": target.bbox, "actor": actor.track_id, "actor_floor_region": region, "reason": "outside_actor_floor_region"})
+            self._note_navigation_target_rejected(target, "outside_actor_floor_region", {"level": self.memory.level.level_index, "target": target.track_id, "target_bbox": target.bbox, "actor": actor.track_id, "actor_floor_region": region, "reason": "outside_actor_floor_region"})
         return intersects
+
+    def _note_navigation_target_rejected(self, target: ObjectObservation, reason: str, payload: dict[str, Any]) -> None:
+        """Dedupe navigation-rejection logging and feed repeated rejections back to
+        the VLM. ar25 previously logged the same (target, reason) 250x per episode
+        while the VLM kept re-binding the exact same unreachable target because the
+        rejection never reached its prompt."""
+        level = self.memory.level
+        key = f"{target.track_id}:{reason}"
+        level.nav_reject_counts[key] += 1
+        count = level.nav_reject_counts[key]
+        if count in (1, 5, 25, 100):
+            self.logger.log_event("navigation_target_rejected", {**payload, "repeat_count": count})
+        if count == 3:
+            note = (
+                f"Navigation target {target.track_id} keeps being rejected ({reason}): the controlled actor cannot reach it. "
+                "Do NOT re-bind it as a move_to target. Either pick a target reachable by the actor, or explain the mechanism "
+                "(e.g. a coupled/secondary object is what must reach it) via probe_action/action_sequence steps instead of move_to."
+            )
+            if note[:60] not in (level.notes_for_next_call or ""):
+                level.notes_for_next_call = _short(note + " " + (level.notes_for_next_call or ""), 700)
 
     def _has_learned_vector_toward(self, actor: ObjectObservation, target: ObjectObservation) -> bool:
         dx = float(target.centroid[0] - actor.centroid[0])
@@ -4452,7 +6195,225 @@ class MyAgent(_BaseAgent):
         bx0, by0, bx1, by1 = b
         return not (ax1 < bx0 - margin or ax0 > bx1 + margin or ay1 < by0 - margin or ay0 > by1 + margin)
 
+    def _seed_selector_pair_hints(self, scene: SceneSnapshot) -> None:
+        level = self.memory.level
+        ids: set[str] = set()
+        for rel in scene.template_relations:
+            if rel.get("possible_selector_pair"):
+                for key in ("left", "right"):
+                    oid = _short(rel.get(key), 24).upper()
+                    if oid:
+                        ids.add(oid)
+        level.selector_pair_object_ids = ids
+
+    def _is_possible_selector_pair_object(self, scene: SceneSnapshot, obj: ObjectObservation) -> bool:
+        if obj.track_id in self.memory.level.selector_pair_object_ids:
+            return True
+        for rel in scene.template_relations:
+            if rel.get("possible_selector_pair") and obj.track_id in {rel.get("left"), rel.get("right")}:
+                return True
+        return False
+
+    def _transform_cycle_bottleneck_active(self, level: LevelMemoryV20 | None = None) -> bool:
+        level = level or self.memory.level
+        if level.bottleneck_reason == "transform_state_cycle":
+            return True
+        if level.transform_state_visits and max(level.transform_state_visits.values()) >= 3:
+            return True
+        return False
+
+    def _critical_counter_blocks_plan_executor(self, scene: SceneSnapshot) -> bool:
+        if scene.counter_value is not None and scene.counter_value <= 1:
+            return True
+        if scene.counter_ratio is not None and scene.counter_ratio <= self.config.critical_resource_ratio:
+            return True
+        return False
+
+    # V2.4: once escalated, this must stay true for the rest of the LEVEL, including
+    # after a game-over reset (_start_new_attempt carries hypothesis_escalation_count
+    # over). ls20 regression: attempt 2's LEVEL_INIT immediately re-issued a
+    # route_reason=geometry plan because the momentary transform_state_cycle signal
+    # (which resets with fresh per-attempt state) had gone quiet, even though the
+    # selector-pair hypothesis from attempt 1 was still correct.
+    def _mechanism_hypothesis_locked(self) -> bool:
+        return self.memory.level.hypothesis_escalation_count >= 1
+
+    _STALE_NAV_ROLE_NAMES = {
+        "target", "goal", "target_frame", "exit", "target_glyph", "glyph", "navigation_target",
+    }
+
+    # V2.5: action sources that pick a move without any specific hypothesis about
+    # game mechanics (pure exhaustive/least-bad/frontier probing while the VLM or
+    # the plan executor has nothing to offer). A transform-state revisit reached
+    # only through these should not be trusted as evidence of a genuine cycling
+    # mechanism - see the transform_state_cycle escalation gate in _record_transition
+    # and _maybe_escalate_mechanism_hypothesis.
+    _UNDIRECTED_ACTION_SOURCES = {
+        "least_bad_nonreset", "frontier_probe", "safe_probe_fallback", "nonreset_guard",
+        "escape_nonreset", "evidence_exhausted_nonreset",
+    }
+
+    def _bind_selector_pair_roles(self, scene: SceneSnapshot) -> dict[str, VisualDescriptor]:
+        level = self.memory.level
+        pair_rels = [r for r in scene.template_relations if r.get("possible_selector_pair")]
+        if not pair_rels:
+            return {}
+        rel = pair_rels[0]
+        left = _short(rel.get("left"), 24).upper()
+        right = _short(rel.get("right"), 24).upper()
+        # Note: left is always treated as the template/status frame and right as the
+        # selector, matching the existing possible_selector_pair convention (left is
+        # the first-seen/lower-id framed object in _template_relations' i<j pairing);
+        # this mirrors pre-V2.4 behavior exactly, no reordering by position.
+        status_id, selector_id = left, right
+        level.local_bindings["status_template_frame"] = status_id
+        level.local_bindings["selector_frame"] = selector_id
+        # V2.7: do NOT copy selector_pair_object_ids into mechanism_evidence_object_ids.
+        # Binding is a visual hypothesis; evidence must come from observed transforms
+        # in _record_transition. Mixing them made the V2.6 evidence gate a no-op on
+        # the second escalate (pair ids were already "evidence" after the first bind).
+        visual_roles: dict[str, VisualDescriptor] = {}
+        for role_name, oid in (("status_template_frame", status_id), ("selector_frame", selector_id)):
+            obj = scene.object_by_id(oid)
+            if obj is not None:
+                visual_roles[role_name] = self._visual_descriptor(obj, scene)
+        return visual_roles
+
+    def _maybe_escalate_mechanism_hypothesis(self, scene: SceneSnapshot, trigger: str) -> None:
+        level = self.memory.level
+        # V2.7: one lock is enough. A second rewrite used to re-fire from vetting
+        # feedback after _bind_selector_pair_roles had already polluted evidence.
+        if level.hypothesis_escalation_count >= 1:
+            return
+        should_escalate = trigger in {
+            "transform_state_cycle",
+            "geometry_plan_rejected_in_cycle",
+            "geometry_to_selector_pair_rejected",
+            "vlm_empty_plan_in_cycle",
+            "repeated_vlm_rejection",
+        }
+        if level.bottleneck_reason.startswith("transform_after_") and level.transform_pressure >= 3:
+            should_escalate = True
+        recent = level.rejected_vlm_plan_feedback[-4:]
+        geo_rejects = 0
+        for entry in recent:
+            if not isinstance(entry, dict):
+                continue
+            reasons = entry.get("reasons") if isinstance(entry.get("reasons"), dict) else {}
+            geo_rejects += int(reasons.get("transform_state_cycle_rejects_geometry_plan", 0))
+        if geo_rejects >= 2:
+            should_escalate = True
+        if level.vlm_issue_repeat_count >= 3 and self._transform_cycle_bottleneck_active(level):
+            should_escalate = True
+        if not should_escalate:
+            return
+        attempt_actions = max(0, level.total_action_count - level.attempt_started_at_action_count)
+        if attempt_actions < self.config.min_hypothesis_escalation_actions:
+            # V2.7: permanently banning geometry mid-attempt is irreversible for the
+            # rest of the level (including after game-over reset). Wait until the
+            # attempt has explored enough that a short early cycle is unlikely to be
+            # ordinary navigation/transform noise (ls20 locked ~step 30).
+            self.logger.log_event(
+                "hypothesis_escalation_deferred_v20",
+                {
+                    "level": level.level_index,
+                    "trigger": trigger,
+                    "reason": "attempt_budget",
+                    "attempt_actions": attempt_actions,
+                    "min_actions": self.config.min_hypothesis_escalation_actions,
+                    "evidence_object_count": len(level.mechanism_evidence_object_ids),
+                },
+            )
+            return
+        if trigger != "transform_state_cycle":
+            # V2.6: vetting-side triggers (plan rejections, empty plans, repeat
+            # bottlenecks) must be corroborated by gameplay evidence before locking
+            # geometry navigation out for the rest of the level: at least one
+            # selector-pair candidate object must actually have been observed
+            # transforming. Without this gate the vetting layer escalates off its
+            # own feedback loop - ls20 locked at ~step 15 from
+            # geometry_to_selector_pair_rejected with ZERO transforms all run, then
+            # rejected 84 VLM geometry steps + 100 navigation targets and spent
+            # 149/240 steps ping-ponging in least_bad_nonreset until fuel bankruptcy.
+            # transform_state_cycle stays exempt: it is already gated on directed
+            # visits in _record_transition and implies observed transforms.
+            pair_ids = set(level.selector_pair_object_ids)
+            for rel in scene.template_relations:
+                if rel.get("possible_selector_pair"):
+                    for key in ("left", "right"):
+                        oid = _short(rel.get(key), 24).upper()
+                        if oid:
+                            pair_ids.add(oid)
+            if not pair_ids or not (pair_ids & level.mechanism_evidence_object_ids):
+                self.logger.log_event(
+                    "hypothesis_escalation_deferred_v20",
+                    {
+                        "level": level.level_index,
+                        "trigger": trigger,
+                        "selector_pair": sorted(pair_ids),
+                        "evidence_object_count": len(level.mechanism_evidence_object_ids),
+                    },
+                )
+                return
+
+        cleared_roles: list[str] = []
+        for role in list(level.local_bindings.keys()):
+            if role.lower() in self._STALE_NAV_ROLE_NAMES or role in self._STALE_NAV_ROLE_NAMES:
+                cleared_roles.append(role)
+                del level.local_bindings[role]
+
+        desc_parts = [
+            "Mechanism hypothesis (escalated): framed inner-pattern objects may form a selector pair.",
+            "Actions likely cycle the selector frame's inner pattern and update the status/template frame pattern.",
+            "Win by aligning the status frame inner_pattern with the goal glyph, not by navigating the actor to corner-frame coordinates.",
+        ]
+        visual_roles = self._bind_selector_pair_roles(scene)
+        if visual_roles:
+            status_id = level.local_bindings.get("status_template_frame", "")
+            selector_id = level.local_bindings.get("selector_frame", "")
+            desc_parts.append(f"status_template_frame={status_id} (template/status frame); selector_frame={selector_id} (cycling selector).")
+
+        mem = self.memory.game.win_condition or WinConditionMemory()
+        mem.description_nl = self._sanitize_game_text(" ".join(desc_parts), scene)
+        mem.visual_roles.update(visual_roles)
+        mem.confidence = max(mem.confidence, 0.45)
+        mem.evidence.append({"level": level.level_index, "trigger": trigger, "source": "hypothesis_escalation_v20"})
+        mem.evidence = mem.evidence[-12:]
+        self.memory.game.win_condition = mem
+
+        note = (
+            "HYPOTHESIS ESCALATION: geometry/coupled_carrier_geometry routes are banned for the rest of this "
+            "level (including after a reset/new attempt). Return a short selector_probe/mechanism_probe "
+            "action_sequence testing how the selector frame changes the status frame inner_pattern relative "
+            "to the goal glyph."
+        )
+        if note[:48] not in (level.notes_for_next_call or ""):
+            level.notes_for_next_call = _short(note + " " + (level.notes_for_next_call or ""), 700)
+        level.current_plan = []
+        level.plan_cursor = 0
+        level.action_recovery_contract = True
+        level.hypothesis_escalation_count += 1
+        self.logger.log_event(
+            "hypothesis_escalated_v20",
+            {
+                "level": level.level_index,
+                "trigger": trigger,
+                "cleared_roles": cleared_roles,
+                "selector_pair": sorted(level.selector_pair_object_ids),
+                "count": level.hypothesis_escalation_count,
+            },
+        )
+
     def _looks_like_nonplayfield_status_cue(self, scene: SceneSnapshot, obj: ObjectObservation, actor: ObjectObservation | None = None) -> bool:
+        # V2.3: this is a pure bbox-position heuristic (corner + far from actor ==
+        # decorative HUD/template). ls20's O1 sits in that corner yet is a real
+        # mechanism object - its inner pattern cycles on a subset of actions. Once
+        # persistent-id transform evidence exists for this object, position alone
+        # must not keep vetoing it as non-navigable/non-interactable forever.
+        if obj.track_id in self.memory.level.mechanism_evidence_object_ids:
+            return False
+        if self._is_possible_selector_pair_object(scene, obj):
+            return False
         x0, y0, x1, y1 = obj.bbox
         bottom_band = y0 >= max(0, scene.height - max(10, scene.height // 5)) and obj.area >= 25
         side_bottom = bottom_band and (x1 <= max(10, scene.width // 5) or x0 >= scene.width - max(10, scene.width // 5))
@@ -4483,9 +6444,15 @@ class MyAgent(_BaseAgent):
     def _navigation_target_id(self, scene: SceneSnapshot, exclude: set[str] | None = None) -> str:
         actor_id = self.memory.level.controlled_object_id
         exclude = exclude or set()
-        role_order = ("target_frame", "goal", "target", "exit", "transformer", "status_pattern")
+        # V2.5: ls20 regression - the VLM consistently named the chained maze
+        # target "target_glyph" (already recognized by _STALE_NAV_ROLE_NAMES for
+        # *rejection* purposes once the mechanism hypothesis is locked), but this
+        # lookup order never recognized it for actual navigation, so even a
+        # legitimately accepted binding could never drive
+        # deterministic_navigation/fuel_target_greedy.
+        role_order = ("target_frame", "goal", "target", "target_glyph", "glyph", "navigation_target", "exit", "transformer", "status_pattern")
         if self._in_transform_mode(scene):
-            role_order = ("transformer", "status_pattern", "target_frame", "goal", "target", "exit")
+            role_order = ("transformer", "status_pattern", "target_frame", "goal", "target", "target_glyph", "glyph", "navigation_target", "exit")
         for role in role_order:
             oid = self.memory.level.local_bindings.get(role, "")
             obj = scene.object_by_id(oid)
@@ -4497,6 +6464,14 @@ class MyAgent(_BaseAgent):
                 for obj in self._descriptor_target_candidates(scene, desc, actor_id):
                     if obj.track_id not in exclude and self._is_navigable_target(scene, obj):
                         return obj.track_id
+        if self._mechanism_hypothesis_locked():
+            # V2.4: ls20 regression - once escalated, an explicit role/descriptor
+            # binding is still honored above, but the "pick whatever looks most
+            # interesting" fallback below kept re-selecting the goal glyph (not a
+            # selector-pair object, so not filtered by _is_navigable_target) and fed
+            # it straight back into deterministic_navigation/fuel_target_greedy,
+            # silently reintroducing the exact geometry-chase the escalation banned.
+            return ""
         for obj in sorted((o for o in scene.objects if o.track_id != actor_id and o.track_id not in exclude), key=lambda o: -self._object_interest_score(scene, o)):
             if self._is_navigable_target(scene, obj):
                 return obj.track_id
@@ -4589,8 +6564,30 @@ class MyAgent(_BaseAgent):
         level = self.memory.level
         if not self._in_transform_mode(scene):
             return None
-        loop_actions = self._recent_loop_actions({"transform"}, min_len=8)
-        mixed_loop_actions = self._recent_loop_actions({"transform", "movement"}, min_len=8)
+        if self._critical_counter_blocks_plan_executor(scene):
+            level.bottleneck_reason = "critical_resource_counter"
+            level.action_recovery_contract = True
+            self.logger.log_event("transform_controller_stand_down_v20", {"level": level.level_index, "state": scene.state_hash[:12], "counter_value": scene.counter_value, "counter_ratio": scene.counter_ratio})
+            return None
+        if (
+            self._source_storm_active("transform_controller", outcomes={"noop", "state_change", "transform", "movement_with_transform"})
+            or self._source_low_yield_active("transform_controller", outcomes={"noop", "state_change", "transform", "movement_with_transform"})
+        ):
+            feedback = {
+                "stage": "source_fuse",
+                "reason": "transform_controller_low_yield",
+                "source": "transform_controller",
+                "recent_events": [e.as_prompt() for e in list(level.recent_events)[-6:]],
+            }
+            level.bottleneck_reason = "transform_controller_low_yield"
+            level.action_recovery_contract = True
+            level.fallback_guard_block_until = max(level.fallback_guard_block_until, level.total_action_count + 1)
+            level.rejected_vlm_plan_feedback.append(feedback)
+            level.rejected_vlm_plan_feedback = level.rejected_vlm_plan_feedback[-12:]
+            self.logger.log_event("source_fuse_open_v20", {"level": level.level_index, "source": "transform_controller", "state": scene.state_hash[:12], "reason": "low_yield_transform_controller"})
+            return None
+        loop_actions = self._recent_loop_actions({"transform", "movement_with_transform"}, min_len=8)
+        mixed_loop_actions = self._recent_loop_actions({"transform", "movement", "movement_with_transform"}, min_len=8)
         if loop_actions or mixed_loop_actions:
             self._quarantine_loop_actions(scene, loop_actions | mixed_loop_actions, "transform_action_loop")
         state_visits = Counter(level.recent_state_hashes)
@@ -4604,10 +6601,33 @@ class MyAgent(_BaseAgent):
             local = level.state_action_outcomes.get(scene.state_hash, {}).get(name, Counter())
             score = 0.0
             if m:
-                score += 0.6 * min(m.transforms, 2) + 1.8 * m.interactions - 2.2 * m.noop_ratio - 2.0 * (m.kind == "undo")
+                # V2.6: cap the interaction bonus like the transform bonus. m.interactions
+                # grows by 1 on every press of a frequently-used interactive action, so an
+                # uncapped 1.8x term reached +50 and up in sb26 (140 ACTION5 presses) and
+                # drowned out every anti-repeat penalty below (-5.0/-6.0), producing 4-8x
+                # ACTION5 runs that burned the hidden energy budget to game over. The cap
+                # keeps early evidence meaningful while letting the run/revisit penalties
+                # actually bite once the action stops yielding new states.
+                score += 0.2 * min(m.transforms, 2) + 1.8 * min(m.interactions, 3) - 2.2 * m.noop_ratio - 2.0 * (m.kind == "undo")
                 if level.transform_pressure >= 8 and m.transforms > m.interactions + 2:
                     score -= 0.35 * (m.transforms - m.interactions)
-            score += 0.35 * min(counts.get("transform", 0), 2) - 0.18 * max(0, counts.get("transform", 0) - 2) + 0.9 * counts.get("interaction", 0) - 1.0 * counts.get("noop", 0)
+            progress_samples = list(level.action_progress_scores.get(name, ()))
+            if progress_samples:
+                recent_progress = progress_samples[-4:]
+                avg_progress = sum(recent_progress) / max(1, len(recent_progress))
+                # V2.7: when recent presses of this action still land on never-seen
+                # after-states, treat the avg_progress penalty as exploration noise
+                # rather than proof the action is dead. sb26 ACTION5 often scored
+                # negative (tiny bar shrink) while every press was a novel state;
+                # the -3.0 branch then permanently starved confirm/transform picks.
+                novel_yield = self._action_recent_novel_state_yield(name)
+                if novel_yield >= 2:
+                    score += 1.5 + 0.4 * min(novel_yield, 4)
+                else:
+                    score += 1.2 * avg_progress
+                    if avg_progress <= 0.0 and counts.get("transform", 0) >= 2:
+                        score -= 3.0
+            score += 0.1 * min(counts.get("transform", 0), 2) - 0.18 * max(0, counts.get("transform", 0) - 2) + 0.9 * min(counts.get("interaction", 0), 3) - 1.0 * counts.get("noop", 0)
             score += 1.25 * local.get("interaction", 0) - 1.4 * local.get("noop", 0) - 0.45 * local.get("transform", 0)
             after_state = trans_graph.get(name)
             if after_state:
@@ -4630,16 +6650,37 @@ class MyAgent(_BaseAgent):
                 score -= 0.5
             if name == "ACTION7" and self.config.avoid_action7:
                 score -= 4.0
+            if (loop_actions or mixed_loop_actions) and name not in (loop_actions | mixed_loop_actions):
+                score += 0.35
             scored.append((score, name))
         if not scored:
             return None
         scored.sort(key=lambda x: (-x[0], int(re.search(r"\d+", x[1]).group(0)) if re.search(r"\d+", x[1]) else 99))
-        if scored[0][0] < -0.5:
+        if scored[0][0] < 0.2:
             return None
         name = scored[0][1]
         proposal = {"name": name, "purpose": "transform-mode controller: test next non-blocked transform action instead of treating it as navigation", "expected_change": "structural transform, object appearance/disappearance, or goal progress", "ignore_recent": True}
         action = self._make_valid_action(proposal, scene, legal, allow_reset=False)
         return (action, proposal, "transform_controller") if action is not None else None
+
+    def _action_recent_novel_state_yield(self, action_name_key: str, *, lookback: int = 8) -> int:
+        """Count recent presses of `action_name_key` that landed on a then-novel state.
+
+        Used to protect expensive-but-progressive interact actions (selector bars,
+        confirm triggers) from being starved by raw avg_progress alone.
+        """
+        level = self.memory.level
+        base = action_name_key.upper().split(":", 1)[0]
+        novel = 0
+        for event in list(level.recent_events)[-lookback:]:
+            if event.action_key.split(":", 1)[0] != base:
+                continue
+            if event.outcome not in {"transform", "interaction", "movement_with_transform", "state_change"}:
+                continue
+            # all_state_visits includes the landing itself; ==1 means first visit.
+            if level.all_state_visits.get(event.after_state, 0) <= 1:
+                novel += 1
+        return novel
 
     def _click_disfavored_by_simple_evidence(self, legal: Sequence[Any]) -> bool:
         legal_names = {action_name(a).upper() for a in legal}
@@ -4666,6 +6707,8 @@ class MyAgent(_BaseAgent):
         if self._click_disfavored_by_simple_evidence(legal):
             return None
         level = self.memory.level
+        if self._normal_click_fuse_active(scene, legal, "deterministic_click"):
+            return None
         # Use deterministic click when there are no grounded movement vectors or when VLM has a click target.
         vector_count = sum(1 for m in self.memory.game.action_meanings.values() if m.kind == "movement" and m.vector is not None and m.confidence >= 0.4)
         if simple_legal and vector_count >= 2 and not level.resource_crisis and not self._in_transform_mode(scene):
@@ -4677,6 +6720,22 @@ class MyAgent(_BaseAgent):
         candidates.extend(o for o in sorted(scene.objects, key=lambda o: -self._object_interest_score(scene, o)) if o not in candidates)
         blocked = set(level.known_noops_by_state.get(scene.state_hash, set())) | set(k for k, until in level.quarantine_until_by_state.get(scene.state_hash, {}).items() if until > level.total_action_count)
         tried = set(level.tried_actions_by_state.get(scene.state_hash, set()))
+        point = self._state_conditioned_success_click(scene, blocked | tried)
+        if point is not None:
+            x, y = point
+            proposal = {
+                "name": "ACTION6",
+                "x": x,
+                "y": y,
+                "target_object_id": "",
+                "purpose": "replay state-conditioned successful click for this exact state",
+                "expected_change": "continue known click-state sequence rather than global neighbor expansion",
+                "ignore_click_exhaustion": True,
+            }
+            action = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+            if action is not None:
+                self.logger.log_event("deterministic_click_state_memory", {"level": level.level_index, "state": scene.state_hash[:12], "action": f"ACTION6:{x},{y}"})
+                return action, proposal, "deterministic_click_state_memory"
         if level.click_success_coords or level.click_success_regions:
             point = self._successful_click_neighbor(scene, blocked | tried)
             if point is not None:
@@ -4773,6 +6832,28 @@ class MyAgent(_BaseAgent):
                 return x, y
         return None
 
+    def _state_conditioned_success_click(self, scene: SceneSnapshot, blocked: set[str]) -> tuple[int, int] | None:
+        level = self.memory.level
+        counter = level.successful_clicks_by_state.get(scene.state_hash, Counter())
+        if not counter:
+            return None
+        blocked_upper = {str(k).upper() for k in blocked}
+        recent_states = set(list(level.recent_state_hashes)[-8:])
+        for key, _count in counter.most_common():
+            key = str(key).upper()
+            m = re.fullmatch(r"ACTION6:(-?\d+),(-?\d+)", key)
+            if not m:
+                continue
+            x, y = int(m.group(1)), int(m.group(2))
+            if key in blocked_upper:
+                continue
+            after_state = level.click_edges_by_state.get(scene.state_hash, {}).get(key, "")
+            if after_state and after_state in recent_states and len(counter) > 1:
+                continue
+            if not self._action_blocked(scene, key, ignore_click_exhaustion=True):
+                return x, y
+        return None
+
     def _successful_click_neighbor(self, scene: SceneSnapshot, blocked: set[str]) -> tuple[int, int] | None:
         level = self.memory.level
         if not level.click_success_coords and not level.click_success_regions:
@@ -4812,6 +6893,10 @@ class MyAgent(_BaseAgent):
 
     def _first_untried_action6_target(self, scene: SceneSnapshot, noops: set[str]) -> tuple[int, int, str] | None:
         actor_id = self.memory.level.controlled_object_id
+        state_click = self._state_conditioned_success_click(scene, noops)
+        if state_click is not None:
+            x, y = state_click
+            return x, y, ""
         success_neighbor = self._successful_click_neighbor(scene, noops)
         if success_neighbor is not None:
             x, y = success_neighbor
@@ -4839,6 +6924,95 @@ class MyAgent(_BaseAgent):
                 return xx, yy, ""
         return None
 
+    def _confirm_probe_action(self, scene: SceneSnapshot, legal: Sequence[Any]) -> tuple[Any, dict[str, Any], str] | None:
+        """点击-选择类游戏（词表=ACTION6+至多2个简单动作，如 sb26 的 5/6[/7]）：
+        一次点击刚产生可见变化时，立刻在“新状态”里测一次简单动作（确认/提交）。
+        证据显示 sb26 的 ACTION5 在选择前的状态里全是 noop 并被全局隔离，导致
+        “点击选中 -> 确认”组合从未被测试过。该探测按状态去重（每状态每动作一次），
+        且不覆盖 retry/掉命/合约等硬证据。
+
+        V2.7: also fire when the last click landed on a brand-new state (even if
+        progress_score was negative from a tiny pixel delta). That is the common
+        "select then confirm" signature across click+simple-action games.
+        """
+        space = self.memory.game.game_action_space
+        if not space or 6 not in space:
+            return None
+        simple_space = [v for v in space if v not in (6, 7)]
+        if self.config.action7_space_probe and 7 in space:
+            simple_space = [v for v in space if v != 6]
+        if not 1 <= len(simple_space) <= 2:
+            return None
+        level = self.memory.level
+        if not level.recent_events:
+            return None
+        last = level.recent_events[-1]
+        if not last.action_key.startswith("ACTION6:") or last.outcome in {"noop", "retry"}:
+            return None
+        delta = last.transition_delta if isinstance(last.transition_delta, dict) else {}
+        if delta.get("life_delta") not in (None, 0):
+            return None
+        # Prefer probing after a click that actually opened a new state; otherwise
+        # keep the old "any non-noop click" behaviour for first-contact learning.
+        after_visits = level.all_state_visits.get(last.after_state, 0)
+        if after_visits > 2 and last.outcome not in {"transform", "interaction", "movement_with_transform"}:
+            return None
+        legal_names = {action_name(a).upper() for a in legal}
+        tried_here = level.tried_actions_by_state.get(scene.state_hash, set())
+        # Prefer simple actions that previously yielded novel states / interactions
+        # over never-tried ones only when both are available.
+        ranked = sorted(
+            simple_space,
+            key=lambda value: (
+                -self._action_recent_novel_state_yield(f"ACTION{value}"),
+                -int((self.memory.game.action_meanings.get(f"ACTION{value}") or ActionMeaning(f"ACTION{value}")).interactions),
+                value,
+            ),
+        )
+        for value in ranked:
+            name = f"ACTION{value}"
+            if name == "ACTION7" and not self._action7_probe_allowed():
+                continue
+            if name not in legal_names or name in tried_here:
+                continue
+            state_counts = level.state_action_outcomes.get(scene.state_hash, {}).get(name, Counter())
+            if state_counts.get("noop", 0) or state_counts.get("retry", 0):
+                continue
+            meaning = self.memory.game.action_meanings.get(name)
+            if meaning is not None and (meaning.retries or meaning.life_losses):
+                continue
+            # Do not hard-skip resource_wasting_noop here when the action still
+            # produces novel states elsewhere - that label can be stale from early
+            # pre-selection presses.
+            if (
+                meaning is not None
+                and meaning.kind == "resource_wasting_noop"
+                and self._action_recent_novel_state_yield(name) == 0
+                and meaning.positive_count == 0
+            ):
+                continue
+            proposal = {
+                "name": name,
+                "purpose": f"confirm-probe: test {name} immediately after a click changed the scene",
+                "expected_change": "commit/confirm the click selection or reveal the click-action pairing",
+                "ignore_recent": True,
+                "ignore_loop_quarantine": True,
+            }
+            made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+            if made is not None:
+                self.logger.log_event(
+                    "confirm_probe_v20",
+                    {
+                        "level": level.level_index,
+                        "state": scene.state_hash[:12],
+                        "action": name,
+                        "after_click": last.action_key,
+                        "after_visits": after_visits,
+                    },
+                )
+                return made, proposal, "confirm_probe"
+        return None
+
     def _frontier_probe_action(self, scene: SceneSnapshot, legal: Sequence[Any]) -> tuple[Any, dict[str, Any], str] | None:
         level = self.memory.level
         name = self._next_unknown_simple_action(legal, scene)
@@ -4847,7 +7021,7 @@ class MyAgent(_BaseAgent):
             action = self._make_valid_action(proposal, scene, legal, allow_reset=False)
             if action is not None:
                 return action, proposal, "frontier_probe"
-        if "ACTION6" in {action_name(a).upper() for a in legal} and not self._click_disfavored_by_simple_evidence(legal):
+        if "ACTION6" in {action_name(a).upper() for a in legal} and not self._click_disfavored_by_simple_evidence(legal) and not self._normal_click_fuse_active(scene, legal, "frontier_probe"):
             blocked = set(level.known_noops_by_state.get(scene.state_hash, set())) | set(level.tried_actions_by_state.get(scene.state_hash, set()))
             picked = self._first_untried_action6_target(scene, blocked)
             if picked is not None:
@@ -4858,12 +7032,36 @@ class MyAgent(_BaseAgent):
                     return action, proposal, "frontier_probe"
         return None
 
+    def _reject_resource_risky_action(self, scene: SceneSnapshot, action: str, reason: str, *, purpose: str = "") -> None:
+        self.logger.log_event(
+            "resource_guard_action_rejected",
+            {
+                "level": self.memory.level.level_index,
+                "state": scene.state_hash[:12],
+                "action": action,
+                "reason": reason,
+                "purpose": _short(purpose, 160),
+            },
+        )
+        self._contract_forbid_action(scene, action, f"resource_guard:{reason}")
+
+    def _resource_recovered_from_scene(self, scene: SceneSnapshot) -> bool:
+        if scene.counter_ratio is None:
+            return False
+        if scene.counter_value is not None and scene.counter_value <= 1:
+            return False
+        recovery_ratio = max(0.5, min(0.95, self.config.low_resource_ratio * 2.0))
+        return scene.counter_ratio >= recovery_ratio
+
     def _resource_crisis_active(self, scene: SceneSnapshot) -> bool:
-        if self.memory.level.resource_crisis:
+        if self.memory.level.resource_crisis and not self._resource_recovered_from_scene(scene):
             return True
         if scene.counter_ratio is not None and scene.counter_ratio <= self.config.low_resource_ratio:
             return True
         if scene.counter_value is not None and scene.counter_value <= 1:
+            return True
+        hidden_ratio = self._hidden_resource_remaining_ratio()
+        if hidden_ratio is not None and hidden_ratio <= self.config.low_resource_ratio:
             return True
         return False
 
@@ -4871,7 +7069,7 @@ class MyAgent(_BaseAgent):
         if self._resource_crisis_active(scene):
             return True
         res = self.memory.game.resource_model
-        if res.visible_bar or scene.counter_value is not None or scene.life_count is not None:
+        if res.visible_bar or scene.counter_value is not None or scene.life_count is not None or res.hidden_action_budget_capacity is not None:
             return True
         for obj in scene.objects:
             if obj.near_edge and (obj.width <= 2 or obj.height <= 2 or obj.area <= 80):
@@ -4903,6 +7101,8 @@ class MyAgent(_BaseAgent):
             return False
         if meaning is None:
             return True
+        if meaning.kind == "interact_or_transform" and meaning.transforms + meaning.interactions > 0:
+            return False
         if meaning.kind in {"unknown", "unknown_or_blocked", "resource_wasting_noop"}:
             return True
         if meaning.kind == "interact_or_transform" and meaning.movements == 0 and (meaning.positive_count <= 0 or meaning.small_transforms > 0):
@@ -4930,21 +7130,96 @@ class MyAgent(_BaseAgent):
         if name == "ACTION6":
             return False
         level = self.memory.level
+        # V2.2: when the counter is a per-step tax every action pays equally (ls20),
+        # NO action is more resource-risky than another. The retry/life_loss signals
+        # below are all counter-exhaustion bankruptcies, not per-action danger, and
+        # firing them here blacklisted the whole action space (absolute_nonreset
+        # lockup). Must short-circuit BEFORE the retry/life checks, since local
+        # state_action retry counts are also poisoned by the bankruptcy step.
+        if level.counter_is_step_tax:
+            return False
         local = level.state_action_outcomes.get(scene.state_hash, {}).get(name, Counter())
-        if local.get("noop", 0) or local.get("retry", 0):
+        meaning = self.memory.game.action_meanings.get(name)
+        if local.get("retry", 0):
+            return True
+        if meaning is not None and (meaning.life_losses > 0 or meaning.retries > 0):
+            return True
+        if local.get("noop", 0) and local.get("transform", 0) + local.get("interaction", 0) + local.get("movement", 0) + local.get("movement_with_transform", 0) == 0:
             return True
         if self._action_leads_to_recent_state(scene, name):
             return True
-        meaning = self.memory.game.action_meanings.get(name)
         if meaning is None:
             return True
-        if meaning.life_losses > 0 or meaning.retries > 0:
-            return True
+        if meaning.transforms + meaning.interactions > 0:
+            return False
         if meaning.kind == "resource_wasting_noop" or meaning.noop_ratio >= 0.5:
             return True
         if meaning.positive_count <= 0:
             return True
         return False
+
+    def _committed_guard_action(self, scene: SceneSnapshot, legal: Sequence[Any]) -> str:
+        """When the previous guard/escape action made visible progress, keep going in
+        that direction instead of alternating opposite moves that cancel each other
+        (the ls20 ACTION1/ACTION2 ping-pong that drained the whole counter)."""
+        level = self.memory.level
+        if not level.recent_events:
+            return ""
+        last = level.recent_events[-1]
+        guard_sources = {"nonreset_guard", "escape_nonreset", "evidence_exhausted_nonreset", "safe_probe_fallback", "least_bad_nonreset"}
+        if last.source not in guard_sources or last.outcome in {"noop", "retry"}:
+            return ""
+        delta = last.transition_delta if isinstance(last.transition_delta, dict) else {}
+        if delta.get("life_delta") not in (None, 0):
+            return ""
+        try:
+            if float(delta.get("progress_score", 0.0)) <= 0.0:
+                return ""
+        except Exception:
+            return ""
+        key = last.action_key.upper()
+        if key.startswith("ACTION6"):
+            return ""
+        run = 0
+        for k in reversed(level.recent_action_keys):
+            if k == key:
+                run += 1
+            else:
+                break
+        if run >= self.config.escape_commit_max_run:
+            return ""
+        legal_names = {action_name(a).upper() for a in legal}
+        return key if key in legal_names else ""
+
+    def _reliable_nonmovement_action(self, scene: SceneSnapshot, legal: Sequence[Any], blocked: set[str]) -> str:
+        """Pick a non-ACTION6 action with a confirmed interact_or_transform track
+        record (e.g. sb26's ACTION5 selector cycle) that safe_probe_fallback would
+        otherwise ignore once its meaning is no longer "unverified". Capped at
+        escape_commit_max_run consecutive picks so this cannot itself become an
+        unbounded single-action loop; the VLM cadence still runs on its own
+        schedule independent of this cap."""
+        level = self.memory.level
+        best_name, best_transforms = "", 0
+        for name in simple_action_names(legal):
+            if name in {"ACTION6", "RESET"} or name in blocked:
+                continue
+            if self._action_blocked(scene, name, ignore_recent=True):
+                continue
+            meaning = self.memory.game.action_meanings.get(name)
+            if meaning is None or meaning.confidence < 0.55 or meaning.kind != "interact_or_transform":
+                continue
+            if meaning.noop_ratio >= 0.5 or meaning.transforms < 2:
+                continue
+            run = 0
+            for key in reversed(level.recent_action_keys):
+                if key != name:
+                    break
+                run += 1
+            if run >= self.config.escape_commit_max_run:
+                continue
+            if meaning.transforms > best_transforms:
+                best_transforms, best_name = meaning.transforms, name
+        return best_name
 
     def _fallback_nonreset_action(self, scene: SceneSnapshot | None, legal: Sequence[Any], purpose: str, *, allow_guard: bool = True) -> tuple[Any, dict[str, Any], str] | None:
         if scene is None:
@@ -4955,15 +7230,11 @@ class MyAgent(_BaseAgent):
         blocked = noops | tried
         recent = set(level.recent_action_keys)
         resource_crisis = self._resource_crisis_active(scene)
-        if self._source_storm_active("force_break_reset_loop"):
-            level.bottleneck_reason = "force_source_fuse_open"
-            self.logger.log_event("source_fuse_open_v20", {"level": level.level_index, "source": "force_break_reset_loop", "state": scene.state_hash[:12]})
-            return None
         for name in simple_action_names(legal):
             if name in blocked or name in recent or self._action_blocked(scene, name):
                 continue
             if resource_crisis and self._resource_risky_nonreset_action(scene, name):
-                self.logger.log_event("resource_guard_action_rejected", {"level": level.level_index, "state": scene.state_hash[:12], "action": name, "reason": "low_resource_risky_fallback"})
+                self._reject_resource_risky_action(scene, name, "low_resource_risky_fallback")
                 continue
             meaning = self.memory.game.action_meanings.get(name)
             if meaning is not None and meaning.confidence >= 0.55 and meaning.kind not in {"unknown", "unknown_or_blocked"}:
@@ -4972,7 +7243,22 @@ class MyAgent(_BaseAgent):
             made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
             if made is not None:
                 return made, proposal, "safe_probe_fallback"
-        if "ACTION6" in {action_name(a).upper() for a in legal}:
+        # V2.6: sb26 regression - once a non-movement action's meaning is confidently
+        # learned (e.g. a selector/palette cycle), the unverified-action probe loop
+        # above skips it on purpose, and this fallback previously fell straight
+        # through to blind ACTION6 coordinate scanning - which never runs out of
+        # fresh coordinates to try and so never gave the known-productive action a
+        # turn again - even in games whose only real lever is repeating that one
+        # action. Prefer it over an undirected click probe when it is not itself
+        # flagged resource-risky. Checked before the ACTION6 branch below so an
+        # always-available "untried coordinate" cannot starve it forever.
+        reliable = self._reliable_nonmovement_action(scene, legal, blocked)
+        if reliable and not (resource_crisis and self._resource_risky_nonreset_action(scene, reliable)):
+            proposal = {"name": reliable, "purpose": f"repeat confirmed interactive action {reliable} instead of an undirected click probe", "expected_change": "continue the only known non-movement action with a track record of real transforms", "ignore_recent": True}
+            made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+            if made is not None:
+                return made, proposal, "known_interaction_repeat"
+        if "ACTION6" in {action_name(a).upper() for a in legal} and not self._click_fuse_blocks_broad_click(scene, legal, "safe_probe_fallback", blocked):
             picked = self._first_untried_action6_target(scene, blocked)
             if picked is not None:
                 x, y, target_id = picked
@@ -4980,21 +7266,43 @@ class MyAgent(_BaseAgent):
                 made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
                 if made is not None:
                     return made, proposal, "safe_probe_fallback"
+        # V2.2 fuel-game directed fallback: every step costs counter, so an undirected
+        # least-bad probe is strictly worse than a greedy step toward the bound target
+        # (ls20 burned 52 fallback steps at ~0 progress ping-ponging between 2-3
+        # states while a valid target existed). Greedy scoring already penalizes
+        # noop-prone moves and recently revisited states.
+        if level.counter_is_step_tax:
+            nav_target = self._navigation_target_id(scene)
+            greedy = self._greedy_move_toward_target(scene, nav_target, legal) if nav_target else ""
+            if greedy:
+                proposal = {"name": greedy, "target_object_id": nav_target, "purpose": f"fuel-aware greedy step toward {nav_target}", "expected_change": "reduce distance to target instead of undirected probing", "ignore_recent": True}
+                made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+                if made is not None:
+                    return made, proposal, "fuel_target_greedy"
         if resource_crisis:
             level.bottleneck_reason = level.bottleneck_reason or "resource_crisis_no_safe_fallback"
             return None
         if not allow_guard:
             level.bottleneck_reason = level.bottleneck_reason or "fallback_waiting_for_vlm"
             return None
-        movement_loop = self._recent_loop_actions({"movement"}, min_len=8, require_state_cycle=True)
-        transform_loop = self._recent_loop_actions({"transform"}, min_len=8)
+        movement_loop = self._recent_loop_actions({"movement", "movement_with_transform"}, min_len=8, require_state_cycle=True)
+        transform_loop = self._recent_loop_actions({"transform", "movement_with_transform"}, min_len=8)
         if movement_loop or transform_loop:
             self._quarantine_loop_actions(scene, movement_loop | transform_loop, "nonreset_guard_action_loop")
+        committed = self._committed_guard_action(scene, legal)
+        if committed and committed != "ACTION6" and not self._action_blocked(scene, committed, ignore_recent=True):
+            proposal = {"name": committed, "purpose": purpose, "expected_change": "continue the guard direction that just made progress", "ignore_recent": True}
+            made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+            if made is not None:
+                return made, proposal, "nonreset_guard"
+        click_fuse_blocks_broad = self._click_fuse_blocks_broad_click(scene, legal, "nonreset_guard", blocked)
         for action in legal:
             name = action_name(action).upper()
             if name == "RESET" or self._action_blocked(scene, name, ignore_recent=True):
                 continue
             if name == "ACTION6":
+                if click_fuse_blocks_broad:
+                    continue
                 picked = self._first_untried_action6_target(scene, set(noops) | set(tried))
                 if picked is None:
                     continue
@@ -5013,22 +7321,91 @@ class MyAgent(_BaseAgent):
 
     def _absolute_nonreset_action(self, scene: SceneSnapshot, legal: Sequence[Any], purpose: str) -> tuple[Any, dict[str, Any], str] | None:
         level = self.memory.level
-        legal_by_value = {action_value(a): a for a in legal}
+        resource_crisis = self._resource_crisis_active(scene)
+        if resource_crisis:
+            self.logger.log_event(
+                "absolute_nonreset_resource_escape_v20",
+                {
+                    "level": level.level_index,
+                    "state": scene.state_hash[:12],
+                    "counter": scene.counter_value,
+                    "ratio": scene.counter_ratio,
+                    "resource_crisis": level.resource_crisis,
+                    "purpose": _short(purpose, 160),
+                },
+            )
+
         recent = list(level.recent_action_keys)
-        candidates: list[tuple[tuple[int, int, int, int], str, Any]] = []
+        state_noops = set(level.known_noops_by_state.get(scene.state_hash, set()))
+        state_tried = set(level.tried_actions_by_state.get(scene.state_hash, set()))
+        contract_rules = level.contract_forbidden_by_state.get(scene.state_hash, {})
+        now = level.total_action_count
+
+        def contract_reason_for(name: str) -> str:
+            if name == "ACTION6":
+                return ""
+            return _short(contract_rules.get(name, ""), 160)
+
+        def hard_danger(name: str, reason: str) -> bool:
+            lowered = reason.lower()
+            if "retry" in lowered or "life_loss" in lowered or "life-loss" in lowered:
+                return True
+            outcomes = level.state_action_outcomes.get(scene.state_hash, {}).get(name, Counter())
+            if outcomes.get("retry", 0) > 0:
+                return True
+            meaning = self.memory.game.action_meanings.get(name)
+            return bool(meaning is not None and (meaning.retries > 0 or meaning.life_losses > 0))
+
+        critical_resource = bool(
+            (scene.counter_ratio is not None and scene.counter_ratio <= self.config.critical_resource_ratio)
+            or (scene.counter_value is not None and scene.counter_value <= 1)
+        )
+        candidates: list[tuple[tuple[float, ...], str, Any, str]] = []
+        hard_blocked: list[dict[str, Any]] = []
         for action in legal:
             name = action_name(action).upper()
-            if name == "RESET":
+            if name == "RESET" or not re.fullmatch(r"ACTION\d+", name):
                 continue
+            reason = contract_reason_for(name)
+            if hard_danger(name, reason):
+                hard_blocked.append({"action": name, "reason": reason or "retry_or_life_loss_evidence"})
+                continue
+            if reason:
+                hard_blocked.append({"action": name, "reason": reason})
+                continue
+            value = float(action_value(action))
             if name == "ACTION6":
-                score = (0, 0, 0, 0)
+                score = (3.0, 1.0 if reason else 0.0, 0.0, 0.0, float(recent.count(name)), value)
             else:
-                blocked = self._action_blocked(scene, name, ignore_recent=True, ignore_loop_quarantine=True)
+                meaning = self.memory.game.action_meanings.get(name)
+                positive = float(meaning.positive_count if meaning is not None else 0)
                 risky = self._resource_risky_nonreset_action(scene, name)
-                action7_penalty = 1 if name == "ACTION7" and self.config.avoid_action7 else 0
-                score = (action7_penalty, 1 if blocked else 0, 1 if risky else 0, recent.count(name))
-            candidates.append((score, name, action))
-        for _score, name, action in sorted(candidates, key=lambda item: item[0]):
+                known_noop = name in state_noops
+                tried = name in state_tried
+                local_outcomes = level.state_action_outcomes.get(scene.state_hash, {}).get(name, Counter())
+                local_progress = local_outcomes.get("movement", 0) + local_outcomes.get("transform", 0) + local_outcomes.get("interaction", 0) + local_outcomes.get("level_advanced", 0)
+                if known_noop and local_progress == 0:
+                    hard_blocked.append({"action": name, "reason": "known_noop_here"})
+                    continue
+                if meaning is not None and meaning.kind == "resource_wasting_noop" and positive <= 0:
+                    hard_blocked.append({"action": name, "reason": "resource_wasting_noop"})
+                    continue
+                critical_noop = critical_resource and (known_noop or (local_outcomes.get("noop", 0) > 0 and local_progress == 0))
+                action7_penalty = 8.0 if name == "ACTION7" and self.config.avoid_action7 else 0.0
+                score = (
+                    action7_penalty,
+                    1.0 if reason else 0.0,
+                    3.0 if critical_noop else 0.0,
+                    1.0 if known_noop else 0.0,
+                    1.0 if risky else 0.0,
+                    1.0 if tried else 0.0,
+                    float(recent.count(name)),
+                    -positive,
+                    value,
+                )
+            candidates.append((score, name, action, reason))
+
+        def attempt_candidate(name: str, action: Any, reason: str) -> tuple[Any, dict[str, Any], str] | None:
             if name == "ACTION6":
                 picked = self._first_untried_action6_target(scene, set())
                 if picked is None:
@@ -5039,31 +7416,213 @@ class MyAgent(_BaseAgent):
                 if picked is None and scene.width > 0 and scene.height > 0:
                     picked = (scene.width // 2, scene.height // 2, "")
                 if picked is None:
-                    continue
+                    return None
                 x, y, target_id = picked
-                proposal = {"name": "ACTION6", "x": x, "y": y, "target_object_id": target_id, "purpose": purpose, "expected_change": "last legal non-reset action; bypass ordinary loop/resource guards"}
-                try:
-                    made = self._make_action6(legal_by_value.get(action_value(action), action), x, y, proposal)
-                except Exception:
-                    continue
-                self.logger.log_event("absolute_nonreset_v20", {"level": level.level_index, "state": scene.state_hash[:12], "action": f"ACTION6:{x},{y}", "purpose": purpose})
-                return made, proposal, "absolute_nonreset"
-            action_obj = get_action_by_name(name)
-            if action_obj is None or action_value(action_obj) not in legal_by_value:
+                proposal = {
+                    "name": "ACTION6",
+                    "x": x,
+                    "y": y,
+                    "target_object_id": target_id,
+                    "purpose": purpose,
+                    "expected_change": "escape non-reset click after all guarded planners were exhausted",
+                    "ignore_recent": True,
+                    "ignore_loop_quarantine": True,
+                    "ignore_defer": True,
+                    "ignore_resource_risk": True,
+                }
+                made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+            else:
+                proposal = {
+                    "name": name,
+                    "purpose": purpose,
+                    "expected_change": "escape non-reset probe after all guarded planners were exhausted",
+                    "ignore_recent": True,
+                    "ignore_loop_quarantine": True,
+                    "ignore_defer": True,
+                    "ignore_resource_risk": True,
+                }
+                made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+            if made is None:
+                return None
+            self.logger.log_event(
+                "absolute_nonreset_v20",
+                {
+                    "level": level.level_index,
+                    "state": scene.state_hash[:12],
+                    "action": name,
+                    "source": "escape_nonreset",
+                    "resource_crisis": resource_crisis,
+                    "ignored_contract": False,
+                    "contract_reason": reason,
+                    "purpose": _short(purpose, 160),
+                },
+            )
+            return made, proposal, "escape_nonreset"
+
+        ordered = sorted(candidates, key=lambda item: item[0])
+        committed = self._committed_guard_action(scene, legal)
+        if committed:
+            for _score, name, action, reason in ordered:
+                if name == committed and not reason:
+                    selected = attempt_candidate(name, action, reason)
+                    if selected is not None:
+                        return selected
+                    break
+        for _score, name, action, reason in ordered:
+            if reason:
                 continue
-            proposal = {"name": name, "purpose": purpose, "expected_change": "last legal non-reset action; bypass ordinary loop/resource guards"}
-            self.logger.log_event("absolute_nonreset_v20", {"level": level.level_index, "state": scene.state_hash[:12], "action": name, "purpose": purpose})
-            return self._attach_reasoning(legal_by_value.get(action_value(action_obj), action_obj), proposal), proposal, "absolute_nonreset"
+            selected = attempt_candidate(name, action, reason)
+            if selected is not None:
+                return selected
+        self.logger.log_event(
+            "absolute_nonreset_exhausted_v20",
+            {
+                "level": level.level_index,
+                "state": scene.state_hash[:12],
+                "resource_crisis": resource_crisis,
+                "candidate_count": len(candidates),
+                "hard_blocked": hard_blocked[:8],
+                "purpose": _short(purpose, 160),
+            },
+        )
+        if hard_blocked and not candidates:
+            level.bottleneck_reason = "all_nonreset_actions_blocked_by_evidence"
+            level.action_recovery_contract = True
         return None
+
+    def _evidence_exhausted_nonreset_action(self, scene: SceneSnapshot, legal: Sequence[Any], purpose: str) -> tuple[Any, dict[str, Any], str] | None:
+        level = self.memory.level
+        legal_nonreset = [a for a in legal if action_name(a).upper() != "RESET" and re.fullmatch(r"ACTION\d+", action_name(a).upper())]
+        if not legal_nonreset:
+            return None
+        state_noops = set(level.known_noops_by_state.get(scene.state_hash, set()))
+        state_outcomes = level.state_action_outcomes.get(scene.state_hash, {})
+        contract_rules = level.contract_forbidden_by_state.get(scene.state_hash, {})
+
+        def reason_for(name: str) -> str:
+            if name in contract_rules:
+                return _short(contract_rules[name], 120) or "contract_forbidden"
+            outcomes = state_outcomes.get(name, Counter())
+            meaning = self.memory.game.action_meanings.get(name)
+            if outcomes.get("retry", 0) or (meaning is not None and (meaning.retries or meaning.life_losses)):
+                return "retry_or_life_loss_evidence"
+            if name in state_noops:
+                return "known_noop_here"
+            if name != "ACTION6" and self._resource_risky_nonreset_action(scene, name):
+                return "resource_risky"
+            if self._would_repeat_terminal_suffix(name):
+                return "terminal_suffix_risk"
+            if name == "ACTION7" and self.config.avoid_action7:
+                return "action7_guard"
+            return "guard_exhausted"
+
+        def hard_bad_reason(reason: str) -> bool:
+            if reason == "guard_exhausted":
+                return False
+            lower_reason = reason.lower()
+            return any(
+                marker in lower_reason
+                for marker in ("noop", "no-op", "retry", "life", "resource", "terminal", "suffix", "contract", "blocked", "forbidden", "action7")
+            )
+
+        immediate_counter_crisis = scene.counter_value is not None and scene.counter_value <= 1
+        if immediate_counter_crisis:
+            reasons = [(action_name(a).upper(), reason_for(action_name(a).upper())) for a in legal_nonreset]
+            if reasons and all(hard_bad_reason(reason) for _, reason in reasons):
+                level.bottleneck_reason = "critical_resource_no_safe_sentinel"
+                level.action_recovery_contract = True
+                self.logger.log_event(
+                    "evidence_exhausted_nonreset_stand_down_v20",
+                    {
+                        "level": level.level_index,
+                        "state": scene.state_hash[:12],
+                        "counter_value": scene.counter_value,
+                        "counter_ratio": scene.counter_ratio,
+                        "reasons": {name: reason for name, reason in reasons[:8]},
+                        "purpose": _short(purpose, 160),
+                    },
+                )
+                return None
+
+        recent_usage = Counter(list(level.recent_action_keys)[-8:])
+        state_tried = level.tried_actions_by_state.get(scene.state_hash, set())
+
+        def rank(item: tuple[Any, str]) -> tuple[float, float, float, float]:
+            action, name = item
+            reason = reason_for(name)
+            danger_order = {
+                "guard_exhausted": 0.0,
+                "resource_risky": 1.0,
+                "known_noop_here": 2.0,
+                "contract_forbidden": 3.0,
+                "terminal_suffix_risk": 4.0,
+                "retry_or_life_loss_evidence": 5.0,
+                "action7_guard": 6.0,
+            }
+            reason_key = reason
+            if reason_key not in danger_order:
+                lower_reason = reason.lower()
+                if "retry" in lower_reason or "life_loss" in lower_reason or "life-loss" in lower_reason:
+                    reason_key = "retry_or_life_loss_evidence"
+                elif "resource" in lower_reason:
+                    reason_key = "resource_risky"
+                elif "noop" in lower_reason or "no-op" in lower_reason:
+                    reason_key = "known_noop_here"
+                elif "terminal" in lower_reason or "suffix" in lower_reason:
+                    reason_key = "terminal_suffix_risk"
+                else:
+                    reason_key = "contract_forbidden"
+            danger = danger_order.get(reason_key, 3.0)
+            # V2.2: since the sentinel executes a blacklisted action anyway, at least
+            # prefer an untried (state, action) pair; 81% of ls20 sentinel actions
+            # were repeats of already-observed pairs, i.e. paid resources for zero
+            # information.
+            tried_here = 1.0 if name in state_tried else 0.0
+            return (danger, tried_here, float(recent_usage.get(name, 0)), float(action_value(action)))
+
+        action, name = sorted(((a, action_name(a).upper()) for a in legal_nonreset), key=rank)[0]
+        reason = reason_for(name)
+        proposal: dict[str, Any] = {
+            "name": name,
+            "purpose": purpose,
+            "expected_change": f"non-reset sentinel despite exhausted guards ({reason})",
+            "target_object_id": "",
+        }
+        if name == "ACTION6":
+            picked = self._first_untried_action6_target(scene, set())
+            if picked is None:
+                target = self._choose_special_object(scene)
+                point = self._click_candidates_for_object(scene, target)[0] if target is not None else (scene.width // 2, scene.height // 2)
+                picked = (point[0], point[1], target.track_id if target is not None else "")
+            x, y, target_id = picked
+            proposal.update({"x": x, "y": y, "target_object_id": target_id})
+            made = self._make_action6(action, x, y, proposal)
+        else:
+            made = self._attach_reasoning(action, proposal)
+        self.logger.log_event(
+            "evidence_exhausted_nonreset_v20",
+            {
+                "level": level.level_index,
+                "state": scene.state_hash[:12],
+                "action": name,
+                "reason": reason,
+                "legal_actions": [action_name(a).upper() for a in legal],
+                "purpose": _short(purpose, 160),
+            },
+        )
+        return made, proposal, "evidence_exhausted_nonreset"
 
     def _least_bad_nonreset_action(self, scene: SceneSnapshot, legal: Sequence[Any]) -> tuple[Any, dict[str, Any], str] | None:
         legal_by_value = {action_value(a): a for a in legal}
         level = self.memory.level
         resource_crisis = self._resource_crisis_active(scene)
-        if self._source_storm_active("force_break_reset_loop"):
-            level.bottleneck_reason = "force_source_fuse_open"
-            self.logger.log_event("source_fuse_open_v20", {"level": level.level_index, "source": "force_break_reset_loop", "state": scene.state_hash[:12]})
-            return None
+        committed = self._committed_guard_action(scene, legal)
+        if committed and committed != "ACTION6" and not (committed == "ACTION7" and self.config.avoid_action7):
+            if not self._action_blocked(scene, committed, ignore_recent=True) and not (resource_crisis and self._resource_risky_nonreset_action(scene, committed)):
+                proposal = {"name": committed, "purpose": "least-bad non-reset probe (continue progressing direction)", "expected_change": "keep the direction that just made progress", "ignore_recent": True}
+                made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+                if made is not None:
+                    return made, proposal, "least_bad_nonreset"
         for action in legal:
             name = action_name(action).upper()
             if name == "RESET" or (name == "ACTION7" and self.config.avoid_action7):
@@ -5071,19 +7630,18 @@ class MyAgent(_BaseAgent):
             if name != "ACTION6" and self._action_blocked(scene, name, ignore_recent=True):
                 continue
             if resource_crisis and name != "ACTION6" and self._resource_risky_nonreset_action(scene, name):
-                self.logger.log_event("resource_guard_action_rejected", {"level": level.level_index, "state": scene.state_hash[:12], "action": name, "reason": "low_resource_risky_least_bad"})
+                self._reject_resource_risky_action(scene, name, "low_resource_risky_least_bad")
                 continue
             if name == "ACTION6":
                 blocked = set(level.known_noops_by_state.get(scene.state_hash, set())) | set(level.tried_actions_by_state.get(scene.state_hash, set()))
+                if self._click_fuse_blocks_broad_click(scene, legal, "least_bad_nonreset", blocked):
+                    continue
                 picked = self._first_untried_action6_target(scene, blocked)
                 if picked is None:
                     continue
                 x, y, target_id = picked
                 proposal = {"name": "ACTION6", "x": x, "y": y, "target_object_id": target_id, "purpose": "least-bad non-reset probe", "expected_change": "last safe non-reset probe with fresh click coordinate"}
-                try:
-                    made = self._make_action6(legal_by_value.get(action_value(action), action), x, y, proposal)
-                except Exception:
-                    made = None
+                made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
                 if made is not None:
                     return made, proposal, "least_bad_nonreset"
                 continue
@@ -5091,51 +7649,10 @@ class MyAgent(_BaseAgent):
             if action_obj is None or action_value(action_obj) not in legal_by_value:
                 continue
             proposal = {"name": name, "purpose": "least-bad non-reset probe", "expected_change": "avoid reset only if action is not known noop/risky"}
-            return self._attach_reasoning(legal_by_value.get(action_value(action_obj), action_obj), proposal), proposal, "least_bad_nonreset"
+            made = self._make_valid_action(proposal, scene, legal, allow_reset=False)
+            if made is not None:
+                return made, proposal, "least_bad_nonreset"
         self.logger.log_event("least_bad_nonreset_exhausted_v20", {"level": level.level_index, "state": scene.state_hash[:12], "resource_crisis": resource_crisis})
-        return None
-
-    def _force_nonreset_action(self, scene: SceneSnapshot, legal: Sequence[Any]) -> tuple[Any, dict[str, Any], str] | None:
-        legal_by_value = {action_value(a): a for a in legal}
-        level = self.memory.level
-        resource_crisis = self._resource_crisis_active(scene)
-        if self._source_storm_active("force_break_reset_loop"):
-            level.bottleneck_reason = "force_source_fuse_open"
-            self.logger.log_event("source_fuse_open_v20", {"level": level.level_index, "source": "force_break_reset_loop", "state": scene.state_hash[:12]})
-            return None
-        for action in legal:
-            name = action_name(action).upper()
-            if name == "RESET":
-                continue
-            if name == "ACTION6":
-                blocked = set(level.known_noops_by_state.get(scene.state_hash, set())) | set(level.tried_actions_by_state.get(scene.state_hash, set()))
-                picked = self._first_untried_action6_target(scene, blocked)
-                if picked is None:
-                    picked = self._first_untried_action6_target(scene, set())
-                if picked is None:
-                    continue
-                x, y, target_id = picked
-                proposal = {"name": "ACTION6", "x": x, "y": y, "target_object_id": target_id, "purpose": "force break non-terminal reset loop", "expected_change": "break reset storm with a non-reset click"}
-                try:
-                    made = self._make_action6(legal_by_value.get(action_value(action), action), x, y, proposal)
-                except Exception:
-                    continue
-                if made is not None:
-                    return made, proposal, "force_break_reset_loop"
-                continue
-            if name == "ACTION7" and self.config.avoid_action7:
-                continue
-            if self._action_blocked(scene, name, ignore_recent=True):
-                continue
-            if resource_crisis and self._resource_risky_nonreset_action(scene, name):
-                self.logger.log_event("resource_guard_action_rejected", {"level": level.level_index, "state": scene.state_hash[:12], "action": name, "reason": "low_resource_risky_force"})
-                continue
-            action_obj = get_action_by_name(name)
-            if action_obj is None or action_value(action_obj) not in legal_by_value:
-                continue
-            proposal = {"name": name, "purpose": "force break non-terminal reset loop", "expected_change": "break reset storm"}
-            return self._attach_reasoning(legal_by_value.get(action_value(action_obj), action_obj), proposal), proposal, "force_break_reset_loop"
-        self.logger.log_event("force_nonreset_exhausted_v20", {"level": level.level_index, "state": scene.state_hash[:12], "resource_crisis": resource_crisis})
         return None
 
     def _make_valid_action(self, proposal: dict[str, Any] | None, scene: SceneSnapshot, legal: Sequence[Any], *, allow_reset: bool) -> Any | None:
@@ -5171,13 +7688,30 @@ class MyAgent(_BaseAgent):
                     break
             if same_run >= self.config.max_same_click_run:
                 return None
-            if self._action_blocked(scene, key, ignore_recent=bool(proposal.get("ignore_recent")), ignore_loop_quarantine=bool(proposal.get("ignore_loop_quarantine")), ignore_noop_evidence=bool(proposal.get("ignore_noop_evidence")), ignore_click_exhaustion=bool(proposal.get("ignore_click_exhaustion"))):
+            if self._action_blocked(
+                scene,
+                key,
+                ignore_recent=bool(proposal.get("ignore_recent")),
+                ignore_loop_quarantine=bool(proposal.get("ignore_loop_quarantine")),
+                ignore_noop_evidence=bool(proposal.get("ignore_noop_evidence")),
+                ignore_click_exhaustion=bool(proposal.get("ignore_click_exhaustion")),
+                ignore_contract=bool(proposal.get("ignore_contract")),
+                ignore_defer=bool(proposal.get("ignore_defer")),
+            ):
                 return None
             return self._make_action6(legal_by_value.get(action_value(action), action), x, y, {**proposal, "name": "ACTION6", "x": x, "y": y})
-        if self._action_blocked(scene, name, ignore_recent=bool(proposal.get("ignore_recent")), ignore_loop_quarantine=bool(proposal.get("ignore_loop_quarantine")), ignore_noop_evidence=bool(proposal.get("ignore_noop_evidence"))):
+        if self._action_blocked(
+            scene,
+            name,
+            ignore_recent=bool(proposal.get("ignore_recent")),
+            ignore_loop_quarantine=bool(proposal.get("ignore_loop_quarantine")),
+            ignore_noop_evidence=bool(proposal.get("ignore_noop_evidence")),
+            ignore_contract=bool(proposal.get("ignore_contract")),
+            ignore_defer=bool(proposal.get("ignore_defer")),
+        ):
             return None
-        if not allow_reset and not bool(proposal.get("trusted_plan_sequence")) and self._resource_crisis_active(scene) and self._resource_risky_nonreset_action(scene, name):
-            self.logger.log_event("resource_guard_action_rejected", {"level": self.memory.level.level_index, "state": scene.state_hash[:12], "action": name, "reason": "low_resource_risky_proposal", "purpose": _short(proposal.get("purpose"), 160)})
+        if not allow_reset and not bool(proposal.get("trusted_plan_sequence")) and not bool(proposal.get("ignore_resource_risk")) and self._resource_crisis_active(scene) and self._resource_risky_nonreset_action(scene, name):
+            self._reject_resource_risky_action(scene, name, "low_resource_risky_proposal", purpose=_short(proposal.get("purpose"), 160))
             return None
         return self._attach_reasoning(legal_by_value.get(action_value(action), action), {**proposal, "name": name})
 
@@ -5266,34 +7800,53 @@ class MyAgent(_BaseAgent):
         level.pending_action = PendingAction(name, x, y, _short(proposal.get("purpose"), 260), _short(proposal.get("expected_change"), 260), _short(proposal.get("target_object_id"), 24).upper(), scene, id(latest_frame), self._call_index, source, proposal.get("expected_predicates") if isinstance(proposal.get("expected_predicates"), list) else [], latest_frame, level.last_vlm_mode)
         self.logger.log_event("action_v20", {"level": level.level_index, "step": level.total_action_count, "state": scene.state_hash[:12], "action": key, "source": source, "purpose": proposal.get("purpose"), "counter": scene.counter_value, "lives": scene.life_count, "transform_pressure": level.transform_pressure, "resource_crisis": level.resource_crisis})
 
+    def _emergency_raw_nonreset_action(self, legal: Sequence[Any], purpose: str) -> Any | None:
+        candidates: list[tuple[int, int, int, Any, str]] = []
+        for action in legal:
+            name = action_name(action).upper()
+            if name in {"", "RESET", "ACTION6"} or not re.fullmatch(r"ACTION\d+", name):
+                continue
+            try:
+                number = int(name.replace("ACTION", "", 1))
+            except Exception:
+                number = 999
+            action7_penalty = 1 if name == "ACTION7" and self.config.avoid_action7 else 0
+            recent_count = list(self.memory.level.recent_action_keys).count(name)
+            candidates.append((action7_penalty, recent_count, number, action, name))
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+        _, _, _, action, name = candidates[0]
+        proposal = {
+            "action": name,
+            "purpose": purpose,
+            "expected_change": "Use a legal simple action because the current observation cannot be parsed.",
+            "confidence": 0.05,
+            "target_object_id": "",
+            "expected_predicates": [],
+        }
+        level = self.memory.level
+        level.consecutive_nonterminal_resets = 0
+        level.total_action_count += 1
+        level.actions_since_vlm += 1
+        level.chunk_action_count += 1
+        level.recent_action_keys.append(name)
+        self.logger.log_event("emergency_raw_nonreset_v20", {"action": name, "legal_actions": [action_name(a).upper() for a in legal], "purpose": purpose})
+        return self._attach_reasoning(action, proposal)
+
     def _reset_action(self, *, reason: str = "unspecified", state: str | None = None, scene: SceneSnapshot | None = None, legal: Sequence[Any] = ()) -> Any:
         legal_names = [action_name(a).upper() for a in legal]
         level = self.memory.level
-        cleared_dead_state = ""
         if state not in {"WIN", "GAME_OVER", "NOT_PLAYED", None}:
             level.consecutive_nonterminal_resets += 1
             level.current_plan = []
             level.plan_cursor = 0
-            if reason == "no_nonreset_legal" and scene is not None:
-                dead_state = scene.state_hash
-                had_dead_state = bool(
-                    level.known_noops_by_state.get(dead_state)
-                    or level.tried_actions_by_state.get(dead_state)
-                    or level.quarantine_until_by_state.get(dead_state)
-                )
-                level.known_noops_by_state.pop(dead_state, None)
-                level.tried_actions_by_state.pop(dead_state, None)
-                level.quarantine_until_by_state.pop(dead_state, None)
-                level.click_noops_by_object.clear()
-                level.bottleneck_reason = "reset_storm_recover"
-                cleared_dead_state = dead_state[:12] if had_dead_state else ""
-            else:
-                level.bottleneck_reason = level.bottleneck_reason or "nonterminal_reset_requested"
+            level.bottleneck_reason = level.bottleneck_reason or "nonterminal_reset_requested"
         else:
             level.consecutive_nonterminal_resets = 0
         if reason in {"game_over", "win", "max_actions"}:
             self._flush_last_vlm_io(reason)
-        self.logger.log_event("reset_v20", {"reason": reason, "state_name": state or "", "level": level.level_index, "step": level.total_action_count, "state": scene.state_hash[:12] if scene is not None else "", "legal_actions": legal_names, "consecutive_nonterminal_resets": level.consecutive_nonterminal_resets, "cleared_dead_state": cleared_dead_state})
+        self.logger.log_event("reset_v20", {"reason": reason, "state_name": state or "", "level": level.level_index, "step": level.total_action_count, "state": scene.state_hash[:12] if scene is not None else "", "legal_actions": legal_names, "consecutive_nonterminal_resets": level.consecutive_nonterminal_resets})
         return get_action_by_name("RESET") or getattr(GameAction, "RESET")
 
     def _emergency_action(self, latest_frame: Any, legal: Sequence[Any]) -> Any:
@@ -5320,22 +7873,18 @@ class MyAgent(_BaseAgent):
                 return action
         except Exception:
             pass
+        raw = self._emergency_raw_nonreset_action(legal, "emergency observation failure non-reset fallback")
+        if raw is not None:
+            return raw
         return self._reset_action(reason="emergency_no_nonreset", state=state, legal=legal)
-
-
-# Compatibility aliases for tooling that still imports the V18 names from older scripts.
-V18VLMResult = V20VLMResult
-GameMemoryV18 = GameMemoryV20
-LevelMemoryV18 = LevelMemoryV20
-RuntimeMemoryV18 = RuntimeMemoryV20
 
 
 __all__ = [
     "ActionMeaning", "ActionWithData", "AgentConfig", "CompactEvent", "ComponentObservation",
-    "DecisionLogger", "GameAction", "GameState", "GameMemoryV20", "GameMemoryV18", "LevelMemoryV20", "LevelMemoryV18",
+    "DecisionLogger", "GameAction", "GameState", "GameMemoryV20", "LevelMemoryV20",
     "MyAgent", "ObjectEffectMemory", "ObjectObservation", "ObservationError", "Observer",
     "OpenAICompatibleBackend", "PendingAction", "PlanStep", "Qwen35Backend", "ResourceModel",
-    "RuntimeMemoryV20", "RuntimeMemoryV18", "SceneSnapshot", "TransitionReport", "V20VLMResult", "V18VLMResult", "VLMMode",
+    "RuntimeMemoryV20", "SceneSnapshot", "TransitionReport", "V20VLMResult", "VLMMode",
     "VLMRequest", "VisualDescriptor", "WinConditionMemory", "action6_data", "action_name",
     "action_value", "get_action_by_id", "get_action_by_name", "make_vlm_backend",
     "normalize_legal_actions", "normalize_one_action", "parse_vlm_result", "render_grid",
